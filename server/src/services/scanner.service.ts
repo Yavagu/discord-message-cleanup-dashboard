@@ -9,7 +9,7 @@ import { logger } from '../utils/logger';
 
 export class ScannerService {
   /**
-   * Scan messages matching the filter criteria across specified channels
+   * Scans messages matching filter criteria across target channels up to maxMessagesPerChannel.
    */
   public static async scanMessages(
     jobId: string,
@@ -28,7 +28,6 @@ export class ScannerService {
     let totalScanned = 0;
     const matchingMessages: ScannedMessage[] = [];
 
-    // Filter target channels
     const targetChannels = filter.channelIds.length === 0 || filter.channelIds.includes('all')
       ? channels
       : channels.filter(c => filter.channelIds.includes(c.id));
@@ -36,21 +35,26 @@ export class ScannerService {
     const bulkCutoffDays = SettingsService.getBulkCutoffDays();
     const maxMessagesPerChannel = SettingsService.getSettings().maxMessagesPerChannel;
 
-    logger.info(`Starting message scan for job ${jobId} across ${targetChannels.length} channels (targetUser: ${filter.targetUserId}, cutoff: ${bulkCutoffDays.toFixed(2)}d)`);
+    logger.info(`Starting message scan for job ${jobId} across ${targetChannels.length} channels (target: ${filter.targetUserId}, cutoff: ${bulkCutoffDays.toFixed(2)}d, maxPerChannel: ${maxMessagesPerChannel})`);
 
     if (isDemo) {
-      // Demo Mode Scanning
       const allMockMessages = getMockMessagesForGuild(guildId);
       const targetChannelIds = new Set(targetChannels.map(c => c.id));
       const channelNameMap = new Map(targetChannels.map(c => [c.id, c.name]));
+      const perChannelCount = new Map<string, number>();
 
       for (const msg of allMockMessages) {
         if (!targetChannelIds.has(msg.channelId)) continue;
+
+        const currentCount = perChannelCount.get(msg.channelId) || 0;
+        if (currentCount >= maxMessagesPerChannel) continue;
+
+        perChannelCount.set(msg.channelId, currentCount + 1);
         totalScanned++;
 
         if (FilterService.matchesFilter({ authorId: msg.authorId, timestampUtc: msg.timestampUtc }, filter)) {
           const ageDays = FilterService.calculateAgeDays(msg.timestampUtc);
-          const isBulkDeletable = ageDays <= bulkCutoffDays;
+          const isBulkDeletable = ageDays < bulkCutoffDays;
           const formattedLocal = FilterService.formatLocalTimestamp(msg.timestampUtc, filter.timezone);
 
           matchingMessages.push({
@@ -74,7 +78,6 @@ export class ScannerService {
         }
       }
     } else {
-      // Real Discord API Scanning
       if (!botToken) {
         throw new Error('Bot token is required to scan messages');
       }
@@ -86,20 +89,28 @@ export class ScannerService {
 
         while (keepScanningChannel && channelScanCount < maxMessagesPerChannel) {
           try {
-            const endpoint: string = lastMessageId
-              ? `/channels/${channel.id}/messages?limit=100&before=${lastMessageId}`
-              : `/channels/${channel.id}/messages?limit=100`;
+            // Request only the remaining quantity needed to prevent exceeding the channel maximum
+            const remainingToFetch = Math.min(100, maxMessagesPerChannel - channelScanCount);
+            if (remainingToFetch <= 0) break;
 
-            const { data: rawMessages } = await DiscordApiService.request<any[]>(
-              endpoint,
-              botToken
-            );
+            const endpoint: string = lastMessageId
+              ? `/channels/${channel.id}/messages?limit=${remainingToFetch}&before=${lastMessageId}`
+              : `/channels/${channel.id}/messages?limit=${remainingToFetch}`;
+
+            const response = await DiscordApiService.request<any[]>(endpoint, botToken);
+            const rawMessages = response.data;
 
             if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
               break;
             }
 
             for (const m of rawMessages) {
+              // Guard inner processing so API responses never exceed maxMessagesPerChannel
+              if (channelScanCount >= maxMessagesPerChannel) {
+                keepScanningChannel = false;
+                break;
+              }
+
               totalScanned++;
               channelScanCount++;
               lastMessageId = m.id;
@@ -116,7 +127,7 @@ export class ScannerService {
 
               if (FilterService.matchesFilter({ authorId, timestampUtc }, filter)) {
                 const ageDays = FilterService.calculateAgeDays(timestampUtc);
-                const isBulkDeletable = ageDays <= bulkCutoffDays;
+                const isBulkDeletable = ageDays < bulkCutoffDays;
                 const formattedLocal = FilterService.formatLocalTimestamp(timestampUtc, filter.timezone);
 
                 matchingMessages.push({
@@ -140,11 +151,10 @@ export class ScannerService {
               }
             }
 
-            if (rawMessages.length < 100) {
+            if (rawMessages.length < remainingToFetch) {
               keepScanningChannel = false;
             }
 
-            // Pacing delay to avoid aggressive rate limits
             await new Promise(resolve => setTimeout(resolve, DISCORD_DEFAULT_SCAN_PACING_MS));
           } catch (err) {
             logger.error(`Error scanning channel ${channel.id} (#${channel.name})`, err);
@@ -156,7 +166,6 @@ export class ScannerService {
 
     const durationMs = Date.now() - startTime;
 
-    // Persist scanned messages into SQLite within a transaction
     const insertStmt = db.prepare(`
       INSERT INTO job_scanned_messages (
         job_id, message_id, channel_id, channel_name, author_id,
@@ -168,7 +177,6 @@ export class ScannerService {
 
     db.exec('BEGIN TRANSACTION;');
     try {
-      // Clear any prior scanned messages for this job
       db.prepare('DELETE FROM job_scanned_messages WHERE job_id = ?').run(jobId);
 
       for (const msg of matchingMessages) {
@@ -193,7 +201,6 @@ export class ScannerService {
         );
       }
 
-      // Update job state
       db.prepare(`
         UPDATE cleanup_jobs
         SET status = 'READY', scanned_count = ?, matched_count = ?, selected_count = ?, duration_ms = ?

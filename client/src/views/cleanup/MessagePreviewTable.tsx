@@ -103,7 +103,7 @@ export const MessagePreviewTable: React.FC<MessagePreviewTableProps> = ({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-100 dark:border-discord-dark-accent pb-4">
           <div>
             <h3 className="font-extrabold text-base text-gray-900 dark:text-white">
-              Step 2: Review Scanned Messages ({filteredMessages.length.toLocaleString()})
+              Review Scanned Messages ({filteredMessages.length.toLocaleString()})
             </h3>
             <p className="text-xs text-gray-400">
               Verify message payloads and select items to include in the deletion batch.

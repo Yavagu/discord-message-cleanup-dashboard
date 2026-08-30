@@ -50,10 +50,11 @@ A moderation and bulk message cleanup tool for Discord server administrators. Co
      - **Time Filter**: Any Time, After Time (e.g. after 17:00 / 5:00 PM), Before Time, Time Window (e.g. 09:00 to 17:00 or overnight 22:00 to 04:00).
      - **Compound Filtering**: Combined date range and time window conditions.
 
-4. **14-Day Bulk Deletion Segmentation & Safety Margins**:
-   - Messages under the configured bulk-delete threshold (default: 332 hours / ~13.83 days, capped at 332h max) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
+4. **14-Day Bulk Deletion Segmentation & Live Age Recalculation**:
+   - Messages under the configured bulk-delete threshold (default: 336 hours / 14 days, configurable up to 336h max) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
    - Messages older than the threshold are automatically routed to individual message deletion endpoints with configurable rate-limit pacing.
    - Live age is dynamically recalculated at deletion execution time to prevent race conditions where messages age past the boundary during scan review.
+   - Automatic Fallback: If Discord rejects a batch with `50034` due to clock drift, it automatically falls back to paced individual deletion.
 
 5. **Interactive Preview & Server Revalidation**:
    - Filter, search, and paginate scanned messages before committing any destructive action.
@@ -230,7 +231,7 @@ To use the dashboard with a live Discord server:
 
 The cleanup engine handles Discord's REST API constraints:
 
-1. **14-Day Bulk Delete Rule**: Discord's bulk deletion endpoint (`POST /channels/{channel.id}/messages/bulk-delete`) strictly forbids deleting messages older than 14 days (336 hours). The dashboard evaluates message age against the configured safety cutoff (default: 332 hours, capped at 332h max):
+1. **14-Day Bulk Delete Rule**: Discord's bulk deletion endpoint (`POST /channels/{channel.id}/messages/bulk-delete`) strictly forbids deleting messages older than 14 days (336 hours). The dashboard evaluates message age against the configured threshold (default: 336 hours / 14 days, capped at 336h max):
    - Messages $\le$ Cutoff: Grouped into bulk deletion batches of 2 to 100 messages.
    - Messages $>$ Cutoff: Dispatched individually through `DELETE /channels/{channel.id}/messages/{message.id}` with safety delay pacing.
    - Fallback: If a bulk-delete batch request is rejected with code `50034` due to clock skew, the batch automatically falls back to individual deletion.

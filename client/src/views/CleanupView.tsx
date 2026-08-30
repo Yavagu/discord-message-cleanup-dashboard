@@ -19,13 +19,11 @@ import { DeletionProgressModal } from './cleanup/DeletionProgressModal';
 export const CleanupView: React.FC = () => {
   const { selectedGuild, timezone, addToast, viewJobReport, settings } = useApp();
 
-  // Channels & Members State
   const [channels, setChannels] = useState<DiscordChannel[]>([]);
   const [selectedChannelIds, setSelectedChannelIds] = useState<string[]>(['all']);
   const [channelSearch, setChannelSearch] = useState('');
   const [isChannelDropdownOpen, setIsChannelDropdownOpen] = useState(false);
 
-  // User Selection State
   const [targetUserId, setTargetUserId] = useState('');
   const [selectedMember, setSelectedMember] = useState<GuildMember | null>(null);
   const [userSearchQuery, setUserSearchQuery] = useState('');
@@ -34,17 +32,14 @@ export const CleanupView: React.FC = () => {
   const [memberSearchWarning, setMemberSearchWarning] = useState<string | null>(null);
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
 
-  // Date Filter State
-  const [dateMode, setDateMode] = useState<DateFilterMode>('BETWEEN_DATES');
-  const [startDate, setStartDate] = useState('2026-08-01');
-  const [endDate, setEndDate] = useState('2026-08-15');
+  const [dateMode, setDateMode] = useState<DateFilterMode>('ALL_TIME');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
 
-  // Time Filter State
-  const [timeMode, setTimeMode] = useState<TimeFilterMode>('AFTER_TIME');
-  const [startTime, setStartTime] = useState('17:00');
-  const [endTime, setEndTime] = useState('23:59');
+  const [timeMode, setTimeMode] = useState<TimeFilterMode>('ANY_TIME');
+  const [startTime, setStartTime] = useState('');
+  const [endTime, setEndTime] = useState('');
 
-  // Scan Results State
   const [isScanning, setIsScanning] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [scannedMessages, setScannedMessages] = useState<ScannedMessage[]>([]);
@@ -56,23 +51,25 @@ export const CleanupView: React.FC = () => {
     durationMs: number;
   } | null>(null);
 
-  // Modals State
   const [previewModalMessage, setPreviewModalMessage] = useState<ScannedMessage | null>(null);
   const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deletionProgress, setDeletionProgress] = useState<JobProgressUpdate | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
-  // Cleanup SSE on unmount
+  const closeEventSource = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+  };
+
   useEffect(() => {
     return () => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
+      closeEventSource();
     };
   }, []);
 
-  // Load Channels when selectedGuild changes
   useEffect(() => {
     if (selectedGuild) {
       loadChannels(selectedGuild.id);
@@ -97,16 +94,11 @@ export const CleanupView: React.FC = () => {
       if (res.warning) {
         setMemberSearchWarning(res.warning);
       }
-      if (res.members.length > 0 && !selectedMember) {
-        const defaultMember = res.members.find(m => m.id === '987654321000000001') || res.members[0];
-        handleSelectMember(defaultMember);
-      }
     } catch (err) {
       console.error('Failed to load initial members', err);
     }
   };
 
-  // Debounced search for members
   useEffect(() => {
     if (!selectedGuild) return;
     const timer = setTimeout(async () => {
@@ -145,13 +137,7 @@ export const CleanupView: React.FC = () => {
       if (found) {
         setSelectedMember(found);
       } else {
-        setSelectedMember({
-          id,
-          username: `User_${id.slice(-4)}`,
-          displayName: `Discord User (${id})`,
-          avatarUrl: 'https://cdn.discordapp.com/embed/avatars/0.png',
-          roles: []
-        });
+        setSelectedMember(null);
       }
     }
   };
@@ -172,7 +158,6 @@ export const CleanupView: React.FC = () => {
     setSelectedChannelIds(newIds);
   };
 
-  // Execute Scan
   const handleScanMessages = async () => {
     if (!selectedGuild) {
       addToast({ type: 'warning', title: 'No Server Selected', message: 'Please select a Discord server first.' });
@@ -184,6 +169,7 @@ export const CleanupView: React.FC = () => {
       return;
     }
 
+    closeEventSource();
     setIsScanning(true);
     setScannedMessages([]);
     setSelectedMessageIds(new Set());
@@ -231,7 +217,6 @@ export const CleanupView: React.FC = () => {
     }
   };
 
-  // Selection handlers
   const handleSelectAll = () => {
     setSelectedMessageIds(new Set(scannedMessages.map(m => m.id)));
   };
@@ -250,7 +235,6 @@ export const CleanupView: React.FC = () => {
     setSelectedMessageIds(updated);
   };
 
-  // Open confirmation modal or execute directly if requireDoubleConfirm is disabled
   const handleOpenConfirmModal = () => {
     if (!settings || settings.requireDoubleConfirm) {
       setIsConfirmModalOpen(true);
@@ -259,7 +243,6 @@ export const CleanupView: React.FC = () => {
     }
   };
 
-  // Start Deletion Execution
   const handleConfirmDelete = async () => {
     if (!activeJobId || selectedMessageIds.size === 0) return;
 
@@ -267,11 +250,9 @@ export const CleanupView: React.FC = () => {
     setIsDeleting(true);
 
     try {
-      const sseUrl = `/api/jobs/${activeJobId}/progress`;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
+      closeEventSource();
 
+      const sseUrl = `/api/jobs/${activeJobId}/progress`;
       const es = new EventSource(sseUrl);
       eventSourceRef.current = es;
 
@@ -281,7 +262,7 @@ export const CleanupView: React.FC = () => {
           setDeletionProgress(update);
 
           if (['COMPLETED', 'PARTIALLY_COMPLETED', 'FAILED', 'CANCELLED'].includes(update.status)) {
-            es.close();
+            closeEventSource();
             setIsDeleting(false);
             addToast({
               type: update.status === 'COMPLETED' ? 'success' : update.status === 'PARTIALLY_COMPLETED' ? 'warning' : 'info',
@@ -295,15 +276,38 @@ export const CleanupView: React.FC = () => {
         }
       };
 
-      es.onerror = () => {
-        // SSE error / close
+      es.onerror = async () => {
+        closeEventSource();
+        try {
+          const details = await api.getJobDetails(activeJobId);
+          if (details?.job && ['COMPLETED', 'PARTIALLY_COMPLETED', 'FAILED', 'CANCELLED'].includes(details.job.status)) {
+            setIsDeleting(false);
+            addToast({
+              type: details.job.status === 'COMPLETED' ? 'success' : 'info',
+              title: `Cleanup ${details.job.status.replace(/_/g, ' ')}`,
+              message: `Deleted ${details.job.deletedCount.toLocaleString()} messages.`
+            });
+            viewJobReport(activeJobId);
+            return;
+          }
+        } catch {
+          // Fallback if job details query fails
+        }
+
+        setIsDeleting(false);
+        addToast({
+          type: 'warning',
+          title: 'Live Stream Disconnected',
+          message: 'Real-time progress stream disconnected. Check Audit History for final status.'
+        });
       };
 
       const idsToSend = Array.from(selectedMessageIds);
-      await api.deleteJobMessages(activeJobId, idsToSend);
+      await api.deleteJobMessages(activeJobId, idsToSend, true);
     } catch (err: any) {
+      closeEventSource();
       setIsDeleting(false);
-      addToast({ type: 'error', title: 'Deletion Trigger Error', message: err.message });
+      addToast({ type: 'error', title: 'Deletion Error', message: err.message });
     }
   };
 
@@ -311,7 +315,7 @@ export const CleanupView: React.FC = () => {
     if (!activeJobId) return;
     try {
       await api.cancelJob(activeJobId);
-      addToast({ type: 'info', title: 'Cancellation Sent', message: 'Stopping cleanup worker safely...' });
+      addToast({ type: 'info', title: 'Cancellation Sent', message: 'Stopping cleanup worker...' });
     } catch (err: any) {
       addToast({ type: 'error', title: 'Failed to cancel', message: err.message });
     }
@@ -319,15 +323,14 @@ export const CleanupView: React.FC = () => {
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 pb-16">
-      {/* View Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-black text-gray-900 dark:text-white flex items-center gap-2.5">
             <Eraser className="w-7 h-7 text-discord-blurple" />
-            Message Cleanup Builder
+            Message Cleanup
           </h2>
           <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            Build multi-criteria deletion queries with safe two-step review across text and voice chat channels.
+            Build multi-criteria deletion queries with review and deletion across text and voice channels.
           </p>
         </div>
 
@@ -337,7 +340,6 @@ export const CleanupView: React.FC = () => {
         </div>
       </div>
 
-      {/* 1. Filter Builder Card */}
       <FilterBuilderCard
         selectedMember={selectedMember}
         targetUserId={targetUserId}
@@ -374,7 +376,6 @@ export const CleanupView: React.FC = () => {
         onScan={handleScanMessages}
       />
 
-      {/* 2. Message Preview Table */}
       {scannedMessages.length > 0 && (
         <MessagePreviewTable
           scannedMessages={scannedMessages}
@@ -388,7 +389,6 @@ export const CleanupView: React.FC = () => {
         />
       )}
 
-      {/* Modals */}
       <MessageDetailModal
         message={previewModalMessage}
         onClose={() => setPreviewModalMessage(null)}

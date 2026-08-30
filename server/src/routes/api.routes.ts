@@ -23,12 +23,9 @@ import { logger } from '../utils/logger';
 
 export const apiRouter = Router();
 
-// Apply auth middleware to protect administrative routes
 apiRouter.use(authMiddleware);
 
-// ==========================================
-// 1. AUTHENTICATION & SESSION ROUTES
-// ==========================================
+// Authentication & Session Routes
 
 const loginSchema = z.object({
   password: z.string().min(1, 'Password is required'),
@@ -44,7 +41,6 @@ apiRouter.post('/auth/login', (req: Request, res: Response) => {
 
   const { password, username } = parseResult.data;
 
-  // Constant-time SHA-256 digest verification without insecure fallback backdoor
   const isValid = AuthService.verifyPassword(password);
   if (!isValid) {
     res.status(401).json({ error: 'Invalid administrator password' });
@@ -121,9 +117,7 @@ apiRouter.post('/auth/logout', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-// ==========================================
-// 2. DISCORD BOT CONFIGURATION & AUDIT
-// ==========================================
+// Discord Bot Management
 
 const botConnectSchema = z.object({
   token: z.string().optional(),
@@ -162,7 +156,6 @@ apiRouter.post('/bot/connect', async (req: Request, res: Response) => {
       return;
     }
 
-    // Attach token strictly in backend session memory (never written to DB or disk)
     AuthService.setSessionBotToken(session.id, token);
     db.prepare('UPDATE admin_sessions SET is_demo = 0 WHERE id = ?').run(session.id);
     session.isDemo = false;
@@ -199,9 +192,7 @@ apiRouter.get('/bot/status', async (req: Request, res: Response) => {
   }
 });
 
-// ==========================================
-// 3. GUILDS, CHANNELS & MEMBERS
-// ==========================================
+// Guilds, Channels & Members
 
 apiRouter.get('/guilds', async (req: Request, res: Response) => {
   try {
@@ -239,9 +230,7 @@ apiRouter.get('/guilds/:guildId/members', async (req: Request, res: Response) =>
   }
 });
 
-// ==========================================
-// 4. SCANNING & MESSAGE PREVIEW
-// ==========================================
+// Message Scanning & Search
 
 const scanRequestSchema = z.object({
   guildId: z.string().min(1, 'Server ID is required'),
@@ -297,7 +286,6 @@ apiRouter.post('/jobs/scan', async (req: Request, res: Response) => {
       endTime
     } = parseResult.data;
 
-    // Fetch accessible channels for this guild
     const allChannels = await ChannelService.getGuildChannels(guildId, session.isDemo, session.botToken);
     const targetChannels = channelIds.length === 0 || channelIds.includes('all')
       ? allChannels
@@ -318,7 +306,6 @@ apiRouter.post('/jobs/scan', async (req: Request, res: Response) => {
       endTime
     };
 
-    // Create job record
     const job = JobService.createJob(
       session.id,
       guildId,
@@ -331,7 +318,6 @@ apiRouter.post('/jobs/scan', async (req: Request, res: Response) => {
       filterConfig
     );
 
-    // Run scanner
     const scanResult = await ScannerService.scanMessages(
       job.id,
       guildId,
@@ -360,10 +346,11 @@ apiRouter.post('/jobs/scan', async (req: Request, res: Response) => {
 apiRouter.get('/jobs/:jobId', (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const job = JobService.getJobById(jobId);
+    const session = req.session!;
+    const job = JobService.getJobForSession(jobId, session.id);
 
     if (!job) {
-      res.status(404).json({ error: 'Cleanup job not found' });
+      res.status(404).json({ error: 'Cleanup job not found or unauthorized' });
       return;
     }
 
@@ -434,9 +421,7 @@ apiRouter.get('/jobs/:jobId', (req: Request, res: Response) => {
   }
 });
 
-// ==========================================
-// 5. DELETION EXECUTION & SSE STREAM
-// ==========================================
+// Deletion Execution & Live Progress Stream
 
 const deleteRequestSchema = z.object({
   selectedMessageIds: z.array(z.string()).optional(),
@@ -456,7 +441,6 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
     const session = req.session!;
     const settings = SettingsService.getSettings();
 
-    // Enforce double confirmation backend invariant if enabled
     if (settings.requireDoubleConfirm && confirmed !== true) {
       res.status(400).json({
         error: 'Administrative confirmation is required to execute deletion',
@@ -489,8 +473,13 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
 apiRouter.post('/jobs/:jobId/cancel', (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const cancelled = JobService.cancelJob(jobId);
-    res.json({ success: cancelled });
+    const session = req.session!;
+    const cancelled = JobService.cancelJobForSession(jobId, session.id);
+    if (!cancelled) {
+      res.status(404).json({ error: 'Cleanup job not found or unauthorized' });
+      return;
+    }
+    res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -498,6 +487,13 @@ apiRouter.post('/jobs/:jobId/cancel', (req: Request, res: Response) => {
 
 apiRouter.get('/jobs/:jobId/progress', (req: Request, res: Response) => {
   const jobId = String(req.params.jobId);
+  const session = req.session!;
+
+  const job = JobService.getJobForSession(jobId, session.id);
+  if (!job) {
+    res.status(404).json({ error: 'Cleanup job not found or unauthorized' });
+    return;
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -506,29 +502,24 @@ apiRouter.get('/jobs/:jobId/progress', (req: Request, res: Response) => {
   });
 
   res.write('\n');
-  JobService.registerSSEClient(jobId, res);
+  JobService.registerSSEClientForSession(jobId, session.id, res);
 
-  const job = JobService.getJobById(jobId);
-  if (job) {
-    const initialUpdate = {
-      jobId,
-      status: job.status,
-      totalSelected: job.selectedCount || job.matchedCount,
-      processed: job.deletedCount + job.failedCount,
-      deleted: job.deletedCount,
-      failed: job.failedCount,
-      remaining: Math.max(0, (job.selectedCount || job.matchedCount) - (job.deletedCount + job.failedCount)),
-      percent: (job.selectedCount || job.matchedCount) > 0
-        ? Math.round(((job.deletedCount + job.failedCount) / (job.selectedCount || job.matchedCount)) * 100)
-        : 0
-    };
-    res.write(`data: ${JSON.stringify(initialUpdate)}\n\n`);
-  }
+  const initialUpdate = {
+    jobId,
+    status: job.status,
+    totalSelected: job.selectedCount || job.matchedCount,
+    processed: job.deletedCount + job.failedCount,
+    deleted: job.deletedCount,
+    failed: job.failedCount,
+    remaining: Math.max(0, (job.selectedCount || job.matchedCount) - (job.deletedCount + job.failedCount)),
+    percent: (job.selectedCount || job.matchedCount) > 0
+      ? Math.round(((job.deletedCount + job.failedCount) / (job.selectedCount || job.matchedCount)) * 100)
+      : 0
+  };
+  res.write(`data: ${JSON.stringify(initialUpdate)}\n\n`);
 });
 
-// ==========================================
-// 6. HISTORY, REPORTS & EXPORTS
-// ==========================================
+// History, Reports & Exports
 
 apiRouter.get('/history', (req: Request, res: Response) => {
   try {
@@ -548,10 +539,11 @@ apiRouter.get('/history', (req: Request, res: Response) => {
 apiRouter.get('/reports/:jobId', (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const report = HistoryService.getJobReport(jobId);
+    const session = req.session!;
+    const report = HistoryService.getJobReportForSession(jobId, session.id);
 
     if (!report) {
-      res.status(404).json({ error: 'Report not found for this cleanup job' });
+      res.status(404).json({ error: 'Report not found or unauthorized' });
       return;
     }
 
@@ -565,7 +557,8 @@ apiRouter.get('/reports/:jobId', (req: Request, res: Response) => {
 apiRouter.get('/reports/:jobId/export/json', (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const jsonStr = HistoryService.exportReportAsJSON(jobId);
+    const session = req.session!;
+    const jsonStr = HistoryService.exportReportAsJSONForSession(jobId, session.id);
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="cleanup-report-${jobId}.json"`);
     res.send(jsonStr);
@@ -577,7 +570,8 @@ apiRouter.get('/reports/:jobId/export/json', (req: Request, res: Response) => {
 apiRouter.get('/reports/:jobId/export/csv', (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const csvStr = HistoryService.exportReportAsCSV(jobId);
+    const session = req.session!;
+    const csvStr = HistoryService.exportReportAsCSVForSession(jobId, session.id);
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="cleanup-report-${jobId}.csv"`);
     res.send(csvStr);
@@ -596,19 +590,17 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
   }
 });
 
-// ==========================================
-// 7. APPLICATION SETTINGS ROUTES
-// ==========================================
+// Application Settings
 
 const updateSettingsSchema = z.object({
   pacingMs: z.number().min(DISCORD_MIN_PACING_MS).max(DISCORD_MAX_PACING_MS).optional(),
   bulkCutoffHours: z.number().min(DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS).max(DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS).optional(),
   requireDoubleConfirm: z.boolean().optional(),
   defaultTimezone: z.string().min(1).optional(),
-  maxMessagesPerChannel: z.number().min(100).max(10000).optional()
+  maxMessagesPerChannel: z.number().min(1).max(10000).optional()
 });
 
-apiRouter.get('/settings', (req: Request, res: Response) => {
+apiRouter.get('/settings', (_req: Request, res: Response) => {
   try {
     const settings = SettingsService.getSettings();
     res.json(settings);

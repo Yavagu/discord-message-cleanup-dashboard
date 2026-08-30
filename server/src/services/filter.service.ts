@@ -40,7 +40,7 @@ export class FilterService {
 
     // Reference 'now' in the target timezone for relative presets (Today, Yesterday, Last 7 Days, etc.)
     const nowInTz = DateTime.now().setZone(timezone);
-    const msgDateStr = msgDateTime.toFormat('yyyy-MM-dd'); // e.g. "2026-08-15"
+    const msgDateStr = msgDateTime.toFormat('yyyy-MM-dd');
 
     // 2. Evaluate Date Filter
     const dateMatches = this.evaluateDateFilter(msgDateTime, msgDateStr, filter, nowInTz);
@@ -176,22 +176,23 @@ export class FilterService {
   }
 
   /**
-   * Calculates message age in fractional days relative to current UTC time.
+   * Calculates message age in fractional days relative to current UTC time or an explicit reference time.
    */
-  public static calculateAgeDays(timestampUtc: string): number {
+  public static calculateAgeDays(timestampUtc: string, referenceTime?: DateTime): number {
     const msgTime = DateTime.fromISO(timestampUtc, { zone: 'utc' });
     if (!msgTime.isValid) return 0;
-    const now = DateTime.utc();
+    const now = referenceTime ?? DateTime.utc();
     const diff = now.diff(msgTime, 'days').days;
     return Math.max(0, diff);
   }
 
   /**
    * Evaluates if a message is eligible for Discord bulk delete based on configured cutoff days.
+   * Strict boundary: age < cutoffDays is bulk candidate; age >= cutoffDays is individual deletion.
    */
-  public static isBulkDeletable(timestampUtc: string, customCutoffDays?: number): boolean {
+  public static isBulkDeletable(timestampUtc: string, customCutoffDays?: number, referenceTime?: DateTime): boolean {
     const cutoffDays = customCutoffDays ?? SettingsService.getBulkCutoffDays();
-    const ageDays = this.calculateAgeDays(timestampUtc);
-    return ageDays <= cutoffDays;
+    const ageDays = this.calculateAgeDays(timestampUtc, referenceTime);
+    return ageDays < cutoffDays;
   }
 }

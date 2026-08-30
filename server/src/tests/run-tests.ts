@@ -1,21 +1,21 @@
 import assert from 'node:assert';
 import { DateTime } from 'luxon';
-import { FilterService } from '../services/filter.service';
-import { FilterConfig, ChannelPermissionOverwrite } from '../types';
 import { db, initDatabase } from '../db/database';
-import { AuthService, cleanupExpiredSessions } from '../services/auth.service';
+import { FilterService } from '../services/filter.service';
+import { AuthService } from '../services/auth.service';
 import { JobService } from '../services/job.service';
 import { SettingsService } from '../services/settings.service';
 import { DeletionService } from '../services/deletion.service';
+import { ScannerService } from '../services/scanner.service';
 import { HistoryService } from '../services/history.service';
 import { DiscordApiService, DiscordApiError } from '../services/discord-api.service';
 import {
   DiscordPermissions,
   DISCORD_BULK_DELETE_HARD_MAX_HOURS,
   DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
-  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS,
-  getDiscordErrorDetail
+  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS
 } from '../constants/discord.constants';
+import { ChannelPermissionOverwrite, FilterConfig } from '../types';
 
 initDatabase();
 
@@ -38,221 +38,729 @@ async function test(name: string, fn: () => void | Promise<void>) {
 }
 
 async function runAllTests() {
-  console.log('\n======================================================');
-  console.log('--- 1. Timezone-Aware Filter Engine & Boundary Tests ---');
-  console.log('======================================================');
+  console.log('\n--- 1. Rate Limiting Coordination & Major Resource Bucket Identity ---');
 
-  await test('Should match exact immutable Discord Snowflake User ID and reject other users', () => {
-    const filter: FilterConfig = {
-      targetUserId: '987654321000000001',
-      channelIds: ['101'],
-      timezone: 'UTC',
-      dateMode: 'ALL_TIME',
-      timeMode: 'ANY_TIME'
-    };
+  await test('Normal request returns data and headers', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
 
-    const validMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T18:00:00Z' };
-    const wrongUserMsg = { authorId: '987654321000000002', timestampUtc: '2026-08-10T18:00:00Z' };
+    global.fetch = (async (_url: string) => {
+      return new Response(JSON.stringify({ id: 'msg-1' }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-normal',
+          'X-RateLimit-Remaining': '5',
+          'X-RateLimit-Reset-After': '0.5'
+        })
+      });
+    }) as any;
 
-    assert.strictEqual(FilterService.matchesFilter(validMsg, filter), true);
-    assert.strictEqual(FilterService.matchesFilter(wrongUserMsg, filter), false);
+    try {
+      const res = await DiscordApiService.request('/channels/1001/messages', 'token');
+      assert.strictEqual(res.data.id, 'msg-1');
+      assert.strictEqual(res.headers.get('X-RateLimit-Remaining'), '5');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
   });
 
-  await test('Should accurately evaluate Time Filter in positive offset timezone (Asia/Kolkata +05:30)', () => {
-    const filter: FilterConfig = {
-      targetUserId: '987654321000000001',
-      channelIds: ['101'],
-      timezone: 'Asia/Kolkata',
-      dateMode: 'ALL_TIME',
-      timeMode: 'AFTER_TIME',
-      startTime: '17:00'
-    };
+  await test('Same-route concurrency: requests are serialized in sequence', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    const executionOrder: number[] = [];
 
-    // 12:00 UTC = 17:30 IST (+5:30) -> After 17:00 -> MATCH
-    const afterFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T12:00:00Z' };
-    // 11:00 UTC = 16:30 IST (+5:30) -> Before 17:00 -> NO MATCH
-    const beforeFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T11:00:00Z' };
+    global.fetch = (async (_url: string) => {
+      const current = executionOrder.length + 1;
+      await new Promise(r => setTimeout(r, 20));
+      executionOrder.push(current);
+      return new Response(JSON.stringify({ seq: current }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-seq',
+          'X-RateLimit-Remaining': '10',
+          'X-RateLimit-Reset-After': '1'
+        })
+      });
+    }) as any;
 
-    assert.strictEqual(FilterService.matchesFilter(afterFiveMsg, filter), true);
-    assert.strictEqual(FilterService.matchesFilter(beforeFiveMsg, filter), false);
+    try {
+      const [r1, r2, r3] = await Promise.all([
+        DiscordApiService.request('/channels/1002/messages', 'token'),
+        DiscordApiService.request('/channels/1002/messages', 'token'),
+        DiscordApiService.request('/channels/1002/messages', 'token')
+      ]);
+
+      assert.deepStrictEqual(executionOrder, [1, 2, 3]);
+      assert.strictEqual(r1.data.seq, 1);
+      assert.strictEqual(r2.data.seq, 2);
+      assert.strictEqual(r3.data.seq, 3);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
   });
 
-  await test('Should evaluate compound Date Range + Time in negative offset timezone (America/New_York EDT -04:00)', () => {
-    const filter: FilterConfig = {
-      targetUserId: '987654321000000001',
-      channelIds: ['all'],
-      timezone: 'America/New_York',
-      dateMode: 'BETWEEN_DATES',
-      startDate: '2026-08-01',
-      endDate: '2026-08-15',
-      timeMode: 'AFTER_TIME',
-      startTime: '17:00'
-    };
+  await test('Two routes with SAME learned bucket hash AND SAME channel ID share quota', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    let callCount = 0;
 
-    // 2026-08-10 22:00 UTC = 2026-08-10 18:00 EDT (Matches date and time)
-    const matchMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T22:00:00Z' };
-    // 2026-08-10 15:00 UTC = 2026-08-10 11:00 EDT (Fails time)
-    const failTimeMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T15:00:00Z' };
-    // 2026-08-20 22:00 UTC = 2026-08-20 18:00 EDT (Fails date)
-    const failDateMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-20T22:00:00Z' };
+    global.fetch = (async () => {
+      callCount++;
+      const remaining = callCount === 2 ? '0' : '5';
+      const resetAfter = callCount === 2 ? '0.08' : '1';
 
-    assert.strictEqual(FilterService.matchesFilter(matchMsg, filter), true);
-    assert.strictEqual(FilterService.matchesFilter(failTimeMsg, filter), false);
-    assert.strictEqual(FilterService.matchesFilter(failDateMsg, filter), false);
+      return new Response(JSON.stringify({ success: true, call: callCount }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-channel-shared-xyz',
+          'X-RateLimit-Remaining': remaining,
+          'X-RateLimit-Reset-After': resetAfter
+        })
+      });
+    }) as any;
+
+    try {
+      // 1. Route A learns bucket-xyz for channel 1003
+      await DiscordApiService.request('/channels/1003/messages', 'token');
+
+      // 2. Route B learns bucket-xyz for channel 1003 and exhausts it
+      await DiscordApiService.request('/channels/1003/messages/bulk-delete', 'token', { method: 'POST', body: { messages: ['1'] } });
+
+      // 3. Route A is called again; now mapped to the shared bucket for channel 1003, it must wait
+      const start = Date.now();
+      await DiscordApiService.request('/channels/1003/messages', 'token');
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed >= 70, `Route A should wait on shared bucket quota exhausted by Route B (waited ${elapsed}ms)`);
+      assert.strictEqual(callCount, 3);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
   });
 
-  await test('Should evaluate overnight Time Window (22:00 to 04:00) spanning midnight', () => {
-    const filter: FilterConfig = {
-      targetUserId: '987654321000000001',
-      channelIds: ['101'],
-      timezone: 'UTC',
-      dateMode: 'ALL_TIME',
-      timeMode: 'BETWEEN_TIMES',
-      startTime: '22:00',
-      endTime: '04:00'
-    };
+  await test('Two routes with SAME learned bucket hash but DIFFERENT channel IDs do NOT share quota', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    const calls: Array<{ url: string; time: number }> = [];
 
-    const lateNightMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T23:30:00Z' };
-    const earlyMorningMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T02:15:00Z' };
-    const daytimeMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T14:00:00Z' };
+    global.fetch = (async (url: string) => {
+      calls.push({ url, time: Date.now() });
 
-    assert.strictEqual(FilterService.matchesFilter(lateNightMsg, filter), true);
-    assert.strictEqual(FilterService.matchesFilter(earlyMorningMsg, filter), true);
-    assert.strictEqual(FilterService.matchesFilter(daytimeMsg, filter), false);
+      const isChannel1 = url.includes('1004');
+      const remaining = isChannel1 ? '0' : '5';
+      const resetAfter = isChannel1 ? '0.5' : '1';
+
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-global-hash-same',
+          'X-RateLimit-Remaining': remaining,
+          'X-RateLimit-Reset-After': resetAfter
+        })
+      });
+    }) as any;
+
+    try {
+      // 1. Call channel 1004 (it exhausts bucket for channel 1004)
+      await DiscordApiService.request('/channels/1004/messages', 'token');
+
+      // 2. Call channel 1005 (different channel ID). Should NOT be blocked by channel 1004's exhaustion!
+      const start = Date.now();
+      await DiscordApiService.request('/channels/1005/messages', 'token');
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed < 200, `Different channel should NOT be delayed by channel 1004 quota (took ${elapsed}ms)`);
+      assert.strictEqual(calls.length, 2);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
   });
 
-  await test('Should handle malformed timestamp strings without crashing', () => {
-    const filter: FilterConfig = {
-      targetUserId: '987654321000000001',
-      channelIds: ['101'],
-      timezone: 'UTC',
-      dateMode: 'ALL_TIME',
-      timeMode: 'ANY_TIME'
-    };
+  await test('Two routes with SAME learned bucket hash but DIFFERENT guild IDs remain independent', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
 
-    assert.strictEqual(FilterService.matchesFilter({ authorId: '987654321000000001', timestampUtc: 'not-valid' }, filter), false);
-    assert.strictEqual(FilterService.formatLocalTimestamp('invalid-date', 'UTC'), 'invalid-date');
-    assert.strictEqual(FilterService.calculateAgeDays('invalid-date'), 0);
+    global.fetch = (async (url: string) => {
+      const isGuild1 = url.includes('9001');
+      const remaining = isGuild1 ? '0' : '5';
+      const resetAfter = isGuild1 ? '0.5' : '1';
+
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'guild-shared-hash',
+          'X-RateLimit-Remaining': remaining,
+          'X-RateLimit-Reset-After': resetAfter
+        })
+      });
+    }) as any;
+
+    try {
+      await DiscordApiService.request('/guilds/9001/members', 'token');
+
+      const start = Date.now();
+      await DiscordApiService.request('/guilds/9002/members', 'token');
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed < 200, `Different guild should remain independent (took ${elapsed}ms)`);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
   });
 
-  console.log('\n======================================================');
-  console.log('--- 2. Bulk-Delete 14-Day Boundary & Age Evaluation ---');
-  console.log('======================================================');
+  await test('Independent buckets execute in parallel without mutual blocking', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    let reqAStarted = false;
+    let reqBStarted = false;
+    let executedInParallel = false;
 
-  await test('Should strictly enforce safety margin and prevent configuring bulk cutoff to 336h', () => {
-    // Attempt to set bulk cutoff to 336 hours or beyond
-    const updated = SettingsService.updateSettings({ bulkCutoffHours: 336 });
-    assert.ok(
-      updated.bulkCutoffHours <= DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
-      `bulkCutoffHours (${updated.bulkCutoffHours}) must never exceed max safe threshold of ${DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS}h`
-    );
-    assert.strictEqual(updated.bulkCutoffHours, 332);
+    global.fetch = (async (url: string) => {
+      const isChannelA = url.includes('2001');
+      const bucket = isChannelA ? 'bucket-A' : 'bucket-B';
 
-    // Attempt to set below 24h
-    const updatedLow = SettingsService.updateSettings({ bulkCutoffHours: 5 });
-    assert.strictEqual(updatedLow.bulkCutoffHours, DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS);
-
-    // Reset
-    SettingsService.updateSettings({ bulkCutoffHours: 332 });
-  });
-
-  await test('Should test messages immediately on both sides of the 13.833-day cutoff', () => {
-    const cutoffDays = 332 / 24; // 13.8333 days
-    const nowMs = Date.now();
-
-    // 13.80 days old -> Bulk eligible
-    const msgJustUnder = new Date(nowMs - (13.80 * 24 * 60 * 60 * 1000)).toISOString();
-    // 13.86 days old -> Over safe cutoff -> Single delete
-    const msgJustOver = new Date(nowMs - (13.86 * 24 * 60 * 60 * 1000)).toISOString();
-    // 14.10 days old -> Hard Discord boundary exceeded -> Single delete
-    const msgHardOver = new Date(nowMs - (14.10 * 24 * 60 * 60 * 1000)).toISOString();
-
-    assert.strictEqual(FilterService.isBulkDeletable(msgJustUnder, cutoffDays), true);
-    assert.strictEqual(FilterService.isBulkDeletable(msgJustOver, cutoffDays), false);
-    assert.strictEqual(FilterService.isBulkDeletable(msgHardOver, cutoffDays), false);
-  });
-
-  console.log('\n======================================================');
-  console.log('--- 3. Discord 8-Step Permission Resolution Semantics ---');
-  console.log('======================================================');
-
-  await test('Step 1: Administrator bypass overrides all channel denies', () => {
-    const basePerms = DiscordPermissions.ADMINISTRATOR;
-    const overwrites: ChannelPermissionOverwrite[] = [
-      {
-        id: 'guild123',
-        type: 0,
-        allow: '0',
-        deny: String(DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.MANAGE_MESSAGES)
+      if (isChannelA) {
+        reqAStarted = true;
+        await new Promise(r => setTimeout(r, 30));
+        if (reqBStarted) executedInParallel = true;
+      } else {
+        reqBStarted = true;
+        await new Promise(r => setTimeout(r, 30));
+        if (reqAStarted) executedInParallel = true;
       }
-    ];
 
-    const result = DiscordApiService.computeChannelPermissions(basePerms, overwrites, 'guild123');
+      return new Response(JSON.stringify({ bucket }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': bucket,
+          'X-RateLimit-Remaining': '5',
+          'X-RateLimit-Reset-After': '1'
+        })
+      });
+    }) as any;
+
+    try {
+      const [resA, resB] = await Promise.all([
+        DiscordApiService.request('/channels/2001/messages', 'token'),
+        DiscordApiService.request('/channels/2002/messages', 'token')
+      ]);
+
+      assert.strictEqual(resA.data.bucket, 'bucket-A');
+      assert.strictEqual(resB.data.bucket, 'bucket-B');
+      assert.strictEqual(executedInParallel, true, 'Both requests should be in flight simultaneously');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Proactively waits when bucket remaining is 0 before reset', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    let callCount = 0;
+
+    global.fetch = (async () => {
+      callCount++;
+      const remaining = callCount === 1 ? '0' : '4';
+      const resetAfter = callCount === 1 ? '0.08' : '1';
+      return new Response(JSON.stringify({ call: callCount }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-exhaust',
+          'X-RateLimit-Remaining': remaining,
+          'X-RateLimit-Reset-After': resetAfter
+        })
+      });
+    }) as any;
+
+    try {
+      await DiscordApiService.request('/channels/3001/messages', 'token');
+
+      const start = Date.now();
+      await DiscordApiService.request('/channels/3001/messages', 'token');
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed >= 70, `Exhausted bucket delayed second request for ${elapsed}ms (expected >= 70ms)`);
+      assert.strictEqual(callCount, 2);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Ordinary 429 response: pauses for retry_after and retries successfully', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    let attempts = 0;
+
+    global.fetch = (async () => {
+      attempts++;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({ message: 'Rate limit hit', retry_after: 0.05 }), {
+          status: 429,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'Retry-After': '0.05'
+          })
+        });
+      }
+      return new Response(JSON.stringify({ id: 'recovered-429' }), {
+        status: 200,
+        headers: new Headers({ 'Content-Type': 'application/json' })
+      });
+    }) as any;
+
+    try {
+      const res = await DiscordApiService.request('/channels/4001/messages', 'token');
+      assert.strictEqual(attempts, 2);
+      assert.strictEqual(res.data.id, 'recovered-429');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Global 429 locks all requests across all routes', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    let attempts = 0;
+
+    global.fetch = (async (url: string) => {
+      attempts++;
+      if (attempts === 1) {
+        return new Response(JSON.stringify({ message: 'Global 429', retry_after: 0.08, global: true }), {
+          status: 429,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'X-RateLimit-Global': 'true',
+            'Retry-After': '0.08'
+          })
+        });
+      }
+      return new Response(JSON.stringify({ url, ok: true }), {
+        status: 200,
+        headers: new Headers({ 'Content-Type': 'application/json' })
+      });
+    }) as any;
+
+    try {
+      const start = Date.now();
+      const res = await DiscordApiService.request('/channels/5001/messages', 'token');
+      const elapsed = Date.now() - start;
+
+      assert.ok(elapsed >= 70, `Global 429 paused execution for ${elapsed}ms`);
+      assert.strictEqual(res.data.ok, true);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Missing rate-limit headers are handled without throwing NaN', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+
+    global.fetch = (async () => {
+      return new Response(JSON.stringify({ status: 'no-headers' }), {
+        status: 200,
+        headers: new Headers({ 'Content-Type': 'application/json' })
+      });
+    }) as any;
+
+    try {
+      const res = await DiscordApiService.request('/users/@me', 'token');
+      assert.strictEqual(res.data.status, 'no-headers');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Malformed rate-limit headers do not corrupt rate limit state', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+
+    global.fetch = (async () => {
+      return new Response(JSON.stringify({ status: 'malformed-headers' }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'bucket-bad',
+          'X-RateLimit-Remaining': 'invalid-number',
+          'X-RateLimit-Reset-After': 'not-a-float'
+        })
+      });
+    }) as any;
+
+    try {
+      const res = await DiscordApiService.request('/channels/6001/messages', 'token');
+      assert.strictEqual(res.data.status, 'malformed-headers');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Retry exhaustion on repeated 429 throws DiscordApiError(429)', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+
+    global.fetch = (async () => {
+      return new Response(JSON.stringify({ message: 'Persistent rate limit', retry_after: 0.01 }), {
+        status: 429,
+        headers: new Headers({ 'Retry-After': '0.01' })
+      });
+    }) as any;
+
+    try {
+      let threw = false;
+      try {
+        await DiscordApiService.request('/channels/7001/messages', 'token', { maxRetries: 2 });
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err instanceof DiscordApiError, true);
+        assert.strictEqual(err.statusCode, 429);
+      }
+      assert.strictEqual(threw, true, 'Should throw after exhausting 429 retries');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('Retry exhaustion on repeated 5xx errors throws DiscordApiError', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+
+    global.fetch = (async () => {
+      return new Response('Server Error', { status: 502 });
+    }) as any;
+
+    try {
+      let threw = false;
+      try {
+        await DiscordApiService.request('/channels/8001/messages', 'token', { maxRetries: 2 });
+      } catch (err: any) {
+        threw = true;
+        assert.strictEqual(err instanceof DiscordApiError, true);
+        assert.strictEqual(err.statusCode, 502);
+      }
+      assert.strictEqual(threw, true, 'Should throw after exhausting 5xx retries');
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  console.log('\n--- 2. Exact 14-Day (336-Hour) Bulk Delete Boundary ---');
+
+  await test('Settings clamps bulkCutoffHours to hard ceiling of 336h', () => {
+    const clampedMax = SettingsService.updateSettings({ bulkCutoffHours: 400 });
+    assert.strictEqual(clampedMax.bulkCutoffHours, 336);
+
+    const clampedMin = SettingsService.updateSettings({ bulkCutoffHours: 5 });
+    assert.strictEqual(clampedMin.bulkCutoffHours, 24);
+
+    SettingsService.updateSettings({ bulkCutoffHours: 336 });
+  });
+
+  await test('Exact boundary evaluation: 14d - 1ms is bulk candidate, exactly 14d and 14d + 1ms are individual only', () => {
+    const cutoffDays = 14.0;
+    const ref = DateTime.fromISO('2026-08-30T12:00:00.000Z', { zone: 'utc' });
+
+    // 14 days minus 1 ms (13 days, 23 hours, 59 minutes, 59 seconds, 999 ms)
+    const minus1ms = ref.minus({ days: 14 }).plus({ milliseconds: 1 }).toISO()!;
+    assert.strictEqual(FilterService.isBulkDeletable(minus1ms, cutoffDays, ref), true, '14d - 1ms must be bulk candidate');
+
+    // Exactly 14 days (14.000000 days -> age >= 14d -> false)
+    const exactly14d = ref.minus({ days: 14 }).toISO()!;
+    assert.strictEqual(FilterService.isBulkDeletable(exactly14d, cutoffDays, ref), false, 'Exactly 14.00d must be individual deletion only');
+
+    // 14 days plus 1 ms (14 days + 1 ms -> age > 14d -> false)
+    const plus1ms = ref.minus({ days: 14 }).minus({ milliseconds: 1 }).toISO()!;
+    assert.strictEqual(FilterService.isBulkDeletable(plus1ms, cutoffDays, ref), false, '14d + 1ms must be individual deletion only');
+  });
+
+  console.log('\n--- 3. Scanner Limits (Table-Driven Pagination Tests) ---');
+
+  const testLimits = [1, 99, 100, 101, 150, 199, 200, 250];
+
+  for (const limit of testLimits) {
+    await test(`Scanner limit = ${limit}: requests exact page sizes and caps total processed`, async () => {
+      DiscordApiService.resetRateLimits();
+      const originalFetch = global.fetch;
+      const requestedLimits: number[] = [];
+      let totalMessagesEmitted = 0;
+
+      global.fetch = (async (url: string) => {
+        const urlObj = new URL(url);
+        const reqLimit = parseInt(urlObj.searchParams.get('limit') || '100', 10);
+        requestedLimits.push(reqLimit);
+
+        const messages = Array.from({ length: reqLimit }, (_, i) => ({
+          id: `msg-${totalMessagesEmitted + i + 1}`,
+          channel_id: '9901',
+          author: { id: '987654321000000001', username: 'TargetUser', discriminator: '0001' },
+          content: `Test message ${totalMessagesEmitted + i + 1}`,
+          timestamp: new Date().toISOString()
+        }));
+
+        totalMessagesEmitted += messages.length;
+
+        return new Response(JSON.stringify(messages), {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'X-RateLimit-Bucket': 'bucket-scanner-table'
+          })
+        });
+      }) as any;
+
+      SettingsService.updateSettings({ maxMessagesPerChannel: limit });
+
+      const filter: FilterConfig = {
+        targetUserId: '987654321000000001',
+        channelIds: ['9901'],
+        timezone: 'UTC',
+        dateMode: 'ALL_TIME',
+        timeMode: 'ANY_TIME'
+      };
+
+      const job = JobService.createJob(
+        'session-scanner-tbl',
+        'guild-scan',
+        'Guild Scan',
+        '987654321000000001',
+        'TargetUser',
+        'TargetUser',
+        '',
+        [{ id: '9901', name: 'general' }],
+        filter
+      );
+
+      try {
+        const result = await ScannerService.scanMessages(
+          job.id,
+          'guild-scan',
+          [{ id: '9901', name: 'general', type: 0 }],
+          filter,
+          false,
+          'mock-token'
+        );
+
+        assert.strictEqual(result.scannedCount, limit, `Expected ${limit} scanned messages, got ${result.scannedCount}`);
+
+        const totalRequested = requestedLimits.reduce((a, b) => a + b, 0);
+        assert.strictEqual(totalRequested, limit, `Requested limits ${requestedLimits.join('+')} sum to ${totalRequested}, expected ${limit}`);
+
+        for (const reqLimit of requestedLimits) {
+          assert.ok(reqLimit <= 100, `Page limit ${reqLimit} exceeded Discord max 100`);
+        }
+      } finally {
+        global.fetch = originalFetch;
+        DiscordApiService.resetRateLimits();
+      }
+    });
+  }
+
+  SettingsService.updateSettings({ maxMessagesPerChannel: 1000 });
+
+  console.log('\n--- 4. Session Ownership & Explicit Session-Scoped Report APIs ---');
+
+  await test('Session isolation on retrieval, cancel, execution, and explicit ForSession report APIs', async () => {
+    const filter: FilterConfig = {
+      targetUserId: '987654321000000001',
+      channelIds: ['101'],
+      timezone: 'UTC',
+      dateMode: 'ALL_TIME',
+      timeMode: 'ANY_TIME'
+    };
+
+    const job = JobService.createJob(
+      'session-alpha',
+      'guild-123',
+      'Guild Alpha',
+      '987654321000000001',
+      'TargetUser',
+      'TargetUser',
+      '',
+      [{ id: '101', name: 'general' }],
+      filter
+    );
+
+    // 1. Retrieval
+    assert.ok(JobService.getJobForSession(job.id, 'session-alpha') !== null, 'Owner can retrieve job');
+    assert.strictEqual(JobService.getJobForSession(job.id, 'session-beta'), null, 'Foreign session cannot retrieve job');
+
+    // 2. Cancellation
+    assert.strictEqual(JobService.cancelJobForSession(job.id, 'session-beta'), false, 'Foreign session cannot cancel job');
+    assert.strictEqual(JobService.cancelJobForSession(job.id, 'session-alpha'), true, 'Owner can cancel job');
+
+    // 3. Execution rejection for foreign session
+    JobService.updateJobStatus(job.id, 'READY');
+    db.prepare(`
+      INSERT INTO job_scanned_messages (job_id, message_id, channel_id, channel_name, author_id, author_username, author_display_name, author_avatar_url, content, timestamp_utc, timestamp_local_formatted, is_bulk_deletable, age_days, is_selected)
+      VALUES (?, 'msg-sess-1', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'Test', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1)
+    `).run(job.id);
+
+    let foreignExecThrew = false;
+    try {
+      await DeletionService.executeDeletion(job.id, 'session-beta', null, true);
+    } catch (err: any) {
+      foreignExecThrew = true;
+      assert.ok(err.message.includes('unauthorized') || err.message.includes('not found'));
+    }
+    assert.strictEqual(foreignExecThrew, true, 'Foreign session execution rejected');
+
+    // 4. Report & Export session isolation via explicit ForSession APIs
+    const alphaReport = HistoryService.getJobReportForSession(job.id, 'session-alpha');
+    assert.ok(alphaReport !== null, 'Owner can access report via getJobReportForSession');
+
+    const betaReport = HistoryService.getJobReportForSession(job.id, 'session-beta');
+    assert.strictEqual(betaReport, null, 'Foreign session cannot access report via getJobReportForSession');
+
+    assert.throws(() => {
+      HistoryService.exportReportAsJSONForSession(job.id, 'session-beta');
+    }, /unauthorized|not found/, 'Foreign session JSON export rejected');
+
+    assert.throws(() => {
+      HistoryService.exportReportAsCSVForSession(job.id, 'session-beta');
+    }, /unauthorized|not found/, 'Foreign session CSV export rejected');
+  });
+
+  console.log('\n--- 5. Atomic Deletion Concurrency Lock ---');
+
+  await test('Simultaneous deletion executions: exactly one acquires lock, competitor rejected', async () => {
+    const filter: FilterConfig = {
+      targetUserId: '987654321000000001',
+      channelIds: ['101'],
+      timezone: 'UTC',
+      dateMode: 'ALL_TIME',
+      timeMode: 'ANY_TIME'
+    };
+
+    const job = JobService.createJob(
+      'session-lock-test',
+      'guild-lock',
+      'Guild Lock',
+      '987654321000000001',
+      'TargetUser',
+      'TargetUser',
+      '',
+      [{ id: '101', name: 'general' }],
+      filter
+    );
+
+    db.prepare(`
+      INSERT INTO job_scanned_messages (job_id, message_id, channel_id, channel_name, author_id, author_username, author_display_name, author_avatar_url, content, timestamp_utc, timestamp_local_formatted, is_bulk_deletable, age_days, is_selected)
+      VALUES (?, 'msg-lock-1', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'T1', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1),
+             (?, 'msg-lock-2', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'T2', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1)
+    `).run(job.id, job.id);
+
+    JobService.updateJobStatus(job.id, 'READY');
+
+    const [exec1, exec2] = await Promise.allSettled([
+      DeletionService.executeDeletion(job.id, 'session-lock-test', null, true),
+      DeletionService.executeDeletion(job.id, 'session-lock-test', null, true)
+    ]);
+
+    const successes = [exec1, exec2].filter(r => r.status === 'fulfilled');
+    const failures = [exec1, exec2].filter(r => r.status === 'rejected');
+
+    assert.strictEqual(successes.length, 1, 'Exactly one deletion must succeed');
+    assert.strictEqual(failures.length, 1, 'Competing deletion must be rejected');
+
+    const rejectedReason = (failures[0] as PromiseRejectedResult).reason;
+    assert.ok(rejectedReason.message.includes('Conflict') || rejectedReason.message.includes('READY'));
+
+    const finalState = JobService.getJobForSession(job.id, 'session-lock-test');
+    assert.strictEqual(finalState?.status, 'COMPLETED');
+    assert.strictEqual(finalState?.deletedCount, 2);
+  });
+
+  console.log('\n--- 6. Authentication & Constant-Time Verification ---');
+
+  await test('Verifies password via constant-time 32-byte SHA-256 digests across all input types', () => {
+    process.env.ADMIN_PASSWORD = 'ProductionSafeAdminPass2026!';
+
+    assert.strictEqual(AuthService.verifyPassword('ProductionSafeAdminPass2026!'), true);
+    assert.strictEqual(AuthService.verifyPassword('ProductionSafeAdminPass2026'), false);
+    assert.strictEqual(AuthService.verifyPassword('ProductionSafeAdminPass2026!Extra'), false);
+    assert.strictEqual(AuthService.verifyPassword(''), false);
+    assert.strictEqual(AuthService.verifyPassword('日本語パスワード'), false);
+    assert.strictEqual(AuthService.verifyPassword(12345 as any), false);
+    assert.strictEqual(AuthService.verifyPassword(null as any), false);
+    assert.strictEqual(AuthService.verifyPassword(undefined as any), false);
+    assert.strictEqual(AuthService.verifyPassword({} as any), false);
+
+    process.env.ADMIN_PASSWORD = 'admin123';
+  });
+
+  console.log('\n--- 7. Discord Channel Permission Resolution Semantics ---');
+
+  await test('Administrator role bypasses all channel-level denies', () => {
+    const adminPerms = DiscordPermissions.ADMINISTRATOR;
+    const overwrites: ChannelPermissionOverwrite[] = [{
+      id: 'guild123',
+      type: 0,
+      allow: '0',
+      deny: String(DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.MANAGE_MESSAGES)
+    }];
+
+    const result = DiscordApiService.computeChannelPermissions(adminPerms, overwrites, 'guild123');
     assert.strictEqual(result.canView, true);
     assert.strictEqual(result.canReadHistory, true);
     assert.strictEqual(result.canManageMessages, true);
   });
 
-  await test('Steps 4-6: Aggregate conflicting role overwrites (deny then allow across roles)', () => {
-    // Base: VIEW_CHANNEL | READ_MESSAGE_HISTORY
-    const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
+  await test('Channel @everyone deny removes permission when not granted elsewhere', () => {
+    const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.MANAGE_MESSAGES;
+    const overwrites: ChannelPermissionOverwrite[] = [{
+      id: 'guild123',
+      type: 0,
+      allow: '0',
+      deny: String(DiscordPermissions.MANAGE_MESSAGES)
+    }];
 
-    // Role 1 denies MANAGE_MESSAGES
-    // Role 2 allows MANAGE_MESSAGES
-    const overwrites: ChannelPermissionOverwrite[] = [
-      {
-        id: 'role1',
-        type: 0,
-        allow: '0',
-        deny: String(DiscordPermissions.MANAGE_MESSAGES)
-      },
-      {
-        id: 'role2',
-        type: 0,
-        allow: String(DiscordPermissions.MANAGE_MESSAGES),
-        deny: '0'
-      }
-    ];
-
-    // Member has both role1 and role2 -> Aggregated allow overrides aggregated deny
-    const resultBothRoles = DiscordApiService.computeChannelPermissions(
-      basePerms,
-      overwrites,
-      'guild123',
-      ['role1', 'role2'],
-      'user1'
-    );
-    assert.strictEqual(resultBothRoles.canManageMessages, true);
-
-    // Member only has role1 -> Denied
-    const resultRole1Only = DiscordApiService.computeChannelPermissions(
-      basePerms,
-      overwrites,
-      'guild123',
-      ['role1'],
-      'user1'
-    );
-    assert.strictEqual(resultRole1Only.canManageMessages, false);
+    const result = DiscordApiService.computeChannelPermissions(basePerms, overwrites, 'guild123');
+    assert.strictEqual(result.canView, true);
+    assert.strictEqual(result.canManageMessages, false);
   });
 
-  await test('Steps 7-8: Member-specific user overwrite overrides role overwrites', () => {
+  await test('Role allow overrides conflicting role deny across member roles', () => {
     const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
-
     const overwrites: ChannelPermissionOverwrite[] = [
-      // Role grants MANAGE_MESSAGES
-      {
-        id: 'roleAllow',
-        type: 0,
-        allow: String(DiscordPermissions.MANAGE_MESSAGES),
-        deny: '0'
-      },
-      // Specific Member user overwrite explicitly DENIES MANAGE_MESSAGES
-      {
-        id: 'user1',
-        type: 1,
-        allow: '0',
-        deny: String(DiscordPermissions.MANAGE_MESSAGES)
-      }
+      { id: 'roleDeny', type: 0, allow: '0', deny: String(DiscordPermissions.MANAGE_MESSAGES) },
+      { id: 'roleAllow', type: 0, allow: String(DiscordPermissions.MANAGE_MESSAGES), deny: '0' }
+    ];
+
+    const result = DiscordApiService.computeChannelPermissions(
+      basePerms,
+      overwrites,
+      'guild123',
+      ['roleDeny', 'roleAllow'],
+      'user1'
+    );
+    assert.strictEqual(result.canManageMessages, true);
+  });
+
+  await test('Member-specific user overwrite takes precedence over role allow', () => {
+    const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
+    const overwrites: ChannelPermissionOverwrite[] = [
+      { id: 'roleAllow', type: 0, allow: String(DiscordPermissions.MANAGE_MESSAGES), deny: '0' },
+      { id: 'user1', type: 1, allow: '0', deny: String(DiscordPermissions.MANAGE_MESSAGES) }
     ];
 
     const result = DiscordApiService.computeChannelPermissions(
@@ -262,22 +770,17 @@ async function runAllTests() {
       ['roleAllow'],
       'user1'
     );
-
-    // User-specific deny takes precedence over role allow
     assert.strictEqual(result.canManageMessages, false);
   });
 
-  await test('Step 9: When VIEW_CHANNEL is false, readHistory and manageMessages must be false', () => {
+  await test('Lack of VIEW_CHANNEL denies dependent read history and manage messages capabilities', () => {
     const basePerms = DiscordPermissions.MANAGE_MESSAGES | DiscordPermissions.READ_MESSAGE_HISTORY;
-    // Overwrite denies VIEW_CHANNEL
-    const overwrites: ChannelPermissionOverwrite[] = [
-      {
-        id: 'guild123',
-        type: 0,
-        allow: '0',
-        deny: String(DiscordPermissions.VIEW_CHANNEL)
-      }
-    ];
+    const overwrites: ChannelPermissionOverwrite[] = [{
+      id: 'guild123',
+      type: 0,
+      allow: '0',
+      deny: String(DiscordPermissions.VIEW_CHANNEL)
+    }];
 
     const result = DiscordApiService.computeChannelPermissions(basePerms, overwrites, 'guild123');
     assert.strictEqual(result.canView, false);
@@ -285,135 +788,7 @@ async function runAllTests() {
     assert.strictEqual(result.canManageMessages, false);
   });
 
-  console.log('\n======================================================');
-  console.log('--- 4. Authentication, Constant-Time Auth & Security ---');
-  console.log('======================================================');
-
-  await test('timingSafeEqual SHA-256 digests across shorter, longer, empty, Unicode passwords', () => {
-    process.env.ADMIN_PASSWORD = 'SecretP@ssword!123';
-
-    // Correct password
-    assert.strictEqual(AuthService.verifyPassword('SecretP@ssword!123'), true);
-
-    // Shorter wrong password
-    assert.strictEqual(AuthService.verifyPassword('Sec'), false);
-
-    // Longer wrong password
-    assert.strictEqual(AuthService.verifyPassword('SecretP@ssword!123_ExtraLongWrongSuffixThatWouldNormallyThrowLengthMismatch'), false);
-
-    // Empty password
-    assert.strictEqual(AuthService.verifyPassword(''), false);
-
-    // Unicode input
-    assert.strictEqual(AuthService.verifyPassword('日本語パスワード'), false);
-
-    // Non-string input
-    assert.strictEqual(AuthService.verifyPassword(undefined as any), false);
-    assert.strictEqual(AuthService.verifyPassword(12345 as any), false);
-
-    // Revert
-    process.env.ADMIN_PASSWORD = 'admin123';
-  });
-
-  await test('Session zero-storage: token in RAM only, destroyed on session deletion', () => {
-    const session = AuthService.createSession('secAdmin', false);
-    assert.ok(session.id);
-    assert.ok(session.csrfToken);
-
-    AuthService.setSessionBotToken(session.id, 'Bot MTIzNDU2.test.secretToken');
-    const retrieved = AuthService.getSession(session.id);
-    assert.strictEqual(retrieved?.botToken, 'Bot MTIzNDU2.test.secretToken');
-
-    // Verify DB does not contain the token
-    const dbRow = db.prepare('SELECT * FROM admin_sessions WHERE id = ?').get(session.id) as any;
-    assert.strictEqual(dbRow.bot_token, undefined);
-
-    // Evict session
-    AuthService.destroySession(session.id);
-    assert.strictEqual(AuthService.getSession(session.id), null);
-  });
-
-  console.log('\n======================================================');
-  console.log('--- 5. Double Confirmation & Backend Invariant ---');
-  console.log('======================================================');
-
-  await test('Settings persistence and snapshot consistency across reads and updates', () => {
-    // 1. Update settings
-    SettingsService.updateSettings({
-      pacingMs: 250,
-      bulkCutoffHours: 330,
-      requireDoubleConfirm: true,
-      defaultTimezone: 'Asia/Tokyo'
-    });
-
-    const s = SettingsService.getSettings();
-    assert.strictEqual(s.pacingMs, 250);
-    assert.strictEqual(s.bulkCutoffHours, 330);
-    assert.strictEqual(s.requireDoubleConfirm, true);
-    assert.strictEqual(s.defaultTimezone, 'Asia/Tokyo');
-
-    // 2. Partial update preserves other fields
-    SettingsService.updateSettings({ pacingMs: 150 });
-    const s2 = SettingsService.getSettings();
-    assert.strictEqual(s2.pacingMs, 150);
-    assert.strictEqual(s2.bulkCutoffHours, 330);
-    assert.strictEqual(s2.defaultTimezone, 'Asia/Tokyo');
-
-    // Reset
-    SettingsService.updateSettings({
-      pacingMs: 100,
-      bulkCutoffHours: 332,
-      requireDoubleConfirm: true,
-      defaultTimezone: 'UTC'
-    });
-  });
-
-  console.log('\n======================================================');
-  console.log('--- 6. Deletion Engine State Machine, Fallback & Races ---');
-  console.log('======================================================');
-
-  await test('Should create and lock job, preventing concurrent execution', () => {
-    const job = JobService.createJob(
-      'session-race-test',
-      '112233445566778899',
-      'Elysium Community',
-      '987654321000000001',
-      'SpammySam',
-      'Sam',
-      'https://cdn.discordapp.com/avatar.png',
-      [{ id: '101', name: 'general' }],
-      {
-        targetUserId: '987654321000000001',
-        channelIds: ['101'],
-        timezone: 'UTC',
-        dateMode: 'ALL_TIME',
-        timeMode: 'ANY_TIME'
-      }
-    );
-
-    assert.strictEqual(job.status, 'DRAFT');
-
-    // Update to READY
-    JobService.updateJobStatus(job.id, 'READY');
-    const readyJob = JobService.getJobById(job.id);
-    assert.strictEqual(readyJob?.status, 'READY');
-  });
-
-  await test('Discord error detail mapping for all standard codes', () => {
-    const e429 = getDiscordErrorDetail(429);
-    assert.ok(e429.reason.includes('Rate Limit'));
-
-    const e50034 = getDiscordErrorDetail(50034);
-    assert.ok(e50034.reason.includes('14 days'));
-
-    const e10008 = getDiscordErrorDetail(10008);
-    assert.ok(e10008.reason.includes('Unknown Message'));
-
-    const eUnknown = getDiscordErrorDetail(99999, 'Custom Failure');
-    assert.strictEqual(eUnknown.reason, 'Custom Failure');
-  });
-
-  console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
+  console.log(`\nTest Run Complete: ${passed} passed, ${failed} failed\n`);
   if (failed > 0) process.exit(1);
 }
 

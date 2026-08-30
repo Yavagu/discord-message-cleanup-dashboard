@@ -39,7 +39,7 @@ export class DeletionService {
   public static async executeDeletion(
     jobId: string,
     sessionId: string,
-    selectedMessageIds: string[] | null, // null means all scanned messages in job
+    selectedMessageIds: string[] | null,
     isDemo: boolean,
     botToken?: string,
     onProgress?: DeletionProgressCallback
@@ -54,11 +54,11 @@ export class DeletionService {
     this.clearCancellation(jobId);
     const startTime = Date.now();
 
-    // 1. Capture coherent settings snapshot at execution start
+    // Snapshot runtime settings for the duration of this execution
     const pacingMs = SettingsService.getPacingMs();
     const bulkCutoffDays = SettingsService.getBulkCutoffDays();
 
-    // 2. Backend Server-Side Revalidation
+    // Verify session authorization and expected state before locking
     const job = db.prepare(`
       SELECT * FROM cleanup_jobs WHERE id = ? AND session_id = ?
     `).get(jobId, sessionId) as any;
@@ -71,7 +71,6 @@ export class DeletionService {
       throw new Error(`Job cannot be executed: current status is ${job.status} (expected READY)`);
     }
 
-    // Fetch all previously scanned messages for this job
     const scannedRows = db.prepare(`
       SELECT * FROM job_scanned_messages WHERE job_id = ?
     `).all(jobId) as any[];
@@ -82,7 +81,7 @@ export class DeletionService {
 
     const scannedMap = new Map<string, any>(scannedRows.map(r => [r.message_id, r]));
 
-    // Deduplicate and revalidate target message IDs against scanned results
+    // Revalidate that all selected message IDs belong to the current scanned job
     let targetRows: any[] = [];
     if (!selectedMessageIds || selectedMessageIds.length === 0) {
       targetRows = scannedRows;
@@ -97,7 +96,7 @@ export class DeletionService {
       }
     }
 
-    // 3. Atomic Job Lock: Transition READY -> DELETING
+    // Atomically transition status from READY to DELETING to prevent concurrent executions
     const lockResult = db.prepare(`
       UPDATE cleanup_jobs
       SET status = 'DELETING', started_at = ?, selected_count = ?
@@ -116,7 +115,6 @@ export class DeletionService {
     let processedCount = 0;
     const failures: CleanupFailure[] = [];
 
-    // Group target messages by channel
     const channelMap = new Map<string, any[]>();
     for (const msg of targetRows) {
       if (!channelMap.has(msg.channel_id)) {
@@ -152,7 +150,6 @@ export class DeletionService {
 
     emitProgress();
 
-    // 4. Process Deletions per channel
     for (const [channelId, msgs] of channelMap.entries()) {
       if (this.isCancelled(jobId)) {
         logger.info(`Job ${jobId} cancelled before channel ${channelId}`);
@@ -161,25 +158,24 @@ export class DeletionService {
 
       const channelName = msgs[0]?.channel_name || channelId;
 
-      // Re-evaluate live message age against current UTC time to prevent race conditions
-      // where a message aged past the 14-day cutoff between scanning and execution
+      // Recalculate message age against live time because jobs may sit in READY long enough to cross the cutoff
       const bulkEligible: any[] = [];
       const individualOnly: any[] = [];
 
       for (const m of msgs) {
         const liveAgeDays = FilterService.calculateAgeDays(m.timestamp_utc);
-        if (liveAgeDays <= bulkCutoffDays) {
+        if (liveAgeDays < bulkCutoffDays) {
           bulkEligible.push(m);
         } else {
           individualOnly.push(m);
         }
       }
 
-      // --- 4A. Process Bulk Deletions (batches of 2 to 100) ---
+      // Process bulk deletions in chunks of 2 to 100
       while (bulkEligible.length > 0) {
         if (this.isCancelled(jobId)) break;
 
-        // If only 1 message remains in bulk list, Discord bulk delete rejects it (min 2); route to single delete
+        // Discord bulk delete endpoint requires at least 2 messages; single leftovers fall back to individual delete
         if (bulkEligible.length < DISCORD_BULK_DELETE_MIN_BATCH_SIZE) {
           individualOnly.push(bulkEligible.pop()!);
           break;
@@ -212,8 +208,7 @@ export class DeletionService {
           } catch (err: any) {
             const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
 
-            // If Discord rejects bulk delete due to invalid age (50034) or permissions,
-            // fallback immediately to individual paced deletion so salvageable messages can still be deleted
+            // If Discord rejects bulk delete due to age (50034), fall back to individual paced deletion
             if (discordCode === 50034) {
               logger.warn(`Bulk delete rejected by Discord with 50034 on channel ${channelId}. Falling back to individual deletion.`);
               individualOnly.push(...batch);
@@ -241,7 +236,7 @@ export class DeletionService {
         }
       }
 
-      // --- 4B. Process Individual Deletions (Older messages, single leftovers, or bulk fallbacks) ---
+      // Process older messages, single leftovers, or bulk fallbacks
       for (const m of individualOnly) {
         if (this.isCancelled(jobId)) break;
 
@@ -281,7 +276,6 @@ export class DeletionService {
           } catch (err: any) {
             const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
 
-            // If message was already deleted (10008), classify specifically
             if (discordCode === 10008) {
               failedCount++;
               processedCount++;
@@ -316,7 +310,6 @@ export class DeletionService {
             }
           }
 
-          // Respect pacing interval between single message deletions
           if (pacingMs > 0 && !this.isCancelled(jobId)) {
             await new Promise(r => setTimeout(r, pacingMs));
           }
@@ -329,7 +322,6 @@ export class DeletionService {
     const isJobCancelled = this.isCancelled(jobId);
     this.clearCancellation(jobId);
 
-    // 5. Determine final job status
     let finalStatus: JobStatus = 'COMPLETED';
     if (isJobCancelled) {
       finalStatus = 'CANCELLED';
@@ -339,7 +331,6 @@ export class DeletionService {
       finalStatus = 'FAILED';
     }
 
-    // 6. Persist failures & final job status in SQLite transaction
     const insertFailStmt = db.prepare(`
       INSERT INTO job_failures (job_id, message_id, channel_id, channel_name, author_id, timestamp_utc, error_code, failure_reason, suggestions)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -375,7 +366,6 @@ export class DeletionService {
 
     logger.info(`Cleanup finished for job ${jobId}: ${deletedCount} deleted, ${failedCount} failed (${finalStatus}) in ${durationMs}ms`);
 
-    // Final progress broadcast
     if (onProgress) {
       onProgress({
         jobId,

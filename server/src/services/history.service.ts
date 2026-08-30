@@ -26,7 +26,7 @@ export interface DetailedCleanupReport {
 
 export class HistoryService {
   /**
-   * Get paginated list of cleanup jobs
+   * Retrieves a paginated list of cleanup jobs with optional status/search filters.
    */
   public static getHistory(params: HistoryFilterParams = {}): {
     jobs: CleanupJob[];
@@ -34,7 +34,7 @@ export class HistoryService {
   } {
     const { status, search, limit = 50, offset = 0 } = params;
 
-    let whereClauses: string[] = [];
+    const whereClauses: string[] = [];
     const args: any[] = [];
 
     if (status && status !== 'ALL') {
@@ -60,19 +60,32 @@ export class HistoryService {
       LIMIT ? OFFSET ?
     `).all(...args, limit, offset) as any[];
 
-    const jobs = rows.map(r => JobService.getJobById(r.id)!);
+    const jobs = rows.map(r => JobService.getJobByIdInternal(r.id)!);
 
     return { jobs, total };
   }
 
   /**
-   * Get detailed report for a specific job
+   * Retrieves a detailed report strictly enforcing session ownership.
    */
-  public static getJobReport(jobId: string): DetailedCleanupReport | null {
-    const job = JobService.getJobById(jobId);
+  public static getJobReportForSession(jobId: string, sessionId: string): DetailedCleanupReport | null {
+    const job = JobService.getJobForSession(jobId, sessionId);
     if (!job) return null;
+    return this.buildReportFromJob(job);
+  }
 
-    // Failures
+  /**
+   * Internal report builder without session check (for internal metrics/system jobs).
+   */
+  public static getJobReportInternal(jobId: string): DetailedCleanupReport | null {
+    const job = JobService.getJobByIdInternal(jobId);
+    if (!job) return null;
+    return this.buildReportFromJob(job);
+  }
+
+  private static buildReportFromJob(job: CleanupJob): DetailedCleanupReport {
+    const jobId = job.id;
+
     const failRows = db.prepare(`
       SELECT * FROM job_failures WHERE job_id = ? ORDER BY id ASC
     `).all(jobId) as any[];
@@ -90,7 +103,6 @@ export class HistoryService {
       suggestions: f.suggestions
     }));
 
-    // Scanned sample
     const scannedRows = db.prepare(`
       SELECT * FROM job_scanned_messages WHERE job_id = ? ORDER BY id ASC LIMIT 500
     `).all(jobId) as any[];
@@ -114,7 +126,6 @@ export class HistoryService {
       ageDays: r.age_days
     }));
 
-    // Calculate channel breakdown
     let channelsSearched: Array<{ id: string; name: string }> = [];
     try {
       channelsSearched = JSON.parse(job.channelsJson);
@@ -162,26 +173,19 @@ export class HistoryService {
     };
   }
 
-  /**
-   * Export report as JSON string
-   */
-  public static exportReportAsJSON(jobId: string): string {
-    const report = this.getJobReport(jobId);
-    if (!report) throw new Error('Report not found');
+  public static exportReportAsJSONForSession(jobId: string, sessionId: string): string {
+    const report = this.getJobReportForSession(jobId, sessionId);
+    if (!report) throw new Error('Report not found or unauthorized');
     return JSON.stringify(report, null, 2);
   }
 
-  /**
-   * Export report as CSV string
-   */
-  public static exportReportAsCSV(jobId: string): string {
-    const report = this.getJobReport(jobId);
-    if (!report) throw new Error('Report not found');
+  public static exportReportAsCSVForSession(jobId: string, sessionId: string): string {
+    const report = this.getJobReportForSession(jobId, sessionId);
+    if (!report) throw new Error('Report not found or unauthorized');
 
     const headers = ['Type', 'Message ID', 'Channel Name', 'Channel ID', 'Author ID', 'Author Username', 'Timestamp (Local)', 'Content / Reason', 'Error Code'];
     const rows: string[][] = [headers];
 
-    // Add failures
     for (const f of report.failures) {
       rows.push([
         'FAILED',
@@ -196,7 +200,6 @@ export class HistoryService {
       ]);
     }
 
-    // Add sample scanned / deleted
     for (const s of report.scannedSample) {
       rows.push([
         'SCANNED/DELETED',
@@ -214,9 +217,6 @@ export class HistoryService {
     return rows.map(r => r.join(',')).join('\n');
   }
 
-  /**
-   * Aggregate dashboard KPI metrics
-   */
   public static getDashboardMetrics(): {
     totalScanned: number;
     totalDeleted: number;
@@ -248,7 +248,7 @@ export class HistoryService {
       SELECT * FROM cleanup_jobs ORDER BY created_at DESC LIMIT 6
     `).all() as any[];
 
-    const recentJobs = recentRows.map(r => JobService.getJobById(r.id)!);
+    const recentJobs = recentRows.map(r => JobService.getJobByIdInternal(r.id)!);
 
     return {
       totalScanned,

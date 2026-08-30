@@ -23,7 +23,6 @@ import {
 } from 'lucide-react';
 
 interface FilterBuilderCardProps {
-  // User selection
   selectedMember: GuildMember | null;
   targetUserId: string;
   userSearchQuery: string;
@@ -37,7 +36,6 @@ interface FilterBuilderCardProps {
   onClearMember: () => void;
   onManualUserIdChange: (id: string) => void;
 
-  // Channels
   channels: DiscordChannel[];
   selectedChannelIds: string[];
   channelSearch: string;
@@ -46,7 +44,6 @@ interface FilterBuilderCardProps {
   setIsChannelDropdownOpen: (open: boolean) => void;
   onToggleChannel: (channelId: string) => void;
 
-  // Date filter
   dateMode: DateFilterMode;
   setDateMode: (mode: DateFilterMode) => void;
   startDate: string;
@@ -54,7 +51,6 @@ interface FilterBuilderCardProps {
   endDate: string;
   setEndDate: (date: string) => void;
 
-  // Time filter
   timeMode: TimeFilterMode;
   setTimeMode: (mode: TimeFilterMode) => void;
   startTime: string;
@@ -62,7 +58,6 @@ interface FilterBuilderCardProps {
   endTime: string;
   setEndTime: (time: string) => void;
 
-  // Scan action
   isScanning: boolean;
   onScan: () => void;
 }
@@ -126,18 +121,18 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
       <div className="border-b border-gray-100 dark:border-discord-dark-accent pb-4 flex items-center justify-between">
         <span className="text-xs font-bold uppercase tracking-wider text-gray-400 flex items-center gap-2">
           <Filter className="w-4 h-4 text-discord-blurple" />
-          Step 1: Define Filtering Criteria
+          Filter Criteria
         </span>
         <span className="text-xs font-medium text-discord-blurple">
-          Strict Snowflake User ID Matching
+          Targeted Snowflake User ID Matching
         </span>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {/* 1. Target Discord User */}
+        {/* Target Discord User */}
         <div className="space-y-2 lg:col-span-1">
           <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-            1. Target Discord User *
+            Target User
           </label>
 
           {selectedMember ? (
@@ -181,7 +176,7 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
                     setIsUserDropdownOpen(true);
                   }}
                   onFocus={() => setIsUserDropdownOpen(true)}
-                  placeholder="Search username or paste User ID..."
+                  placeholder="Search username or enter User ID..."
                   className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-gray-200 dark:border-discord-dark-accent bg-gray-50 dark:bg-discord-dark-bg text-sm text-gray-900 dark:text-white focus:outline-none focus:border-discord-blurple"
                 />
                 {isSearchingMembers && (
@@ -193,7 +188,7 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
                 <div className="absolute left-0 right-0 mt-1 rounded-2xl border border-gray-200 dark:border-discord-dark-accent bg-white dark:bg-discord-dark-card p-2 shadow-2xl z-50 max-h-56 overflow-y-auto space-y-1">
                   {searchedMembers.length === 0 ? (
                     <div className="p-3 text-xs text-gray-400 text-center">
-                      No members matched. Enter an exact 17-20 digit Discord Snowflake ID below.
+                      No members found. You can enter an exact 17–20 digit Discord Snowflake ID below.
                     </div>
                   ) : (
                     searchedMembers.map(m => (
@@ -223,24 +218,24 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
                   type="text"
                   value={targetUserId}
                   onChange={e => onManualUserIdChange(e.target.value)}
-                  placeholder="Direct User ID (18 digits, e.g. 987654321000000001)"
+                  placeholder="Direct User ID (17–20 digits)"
                   className="w-full px-3 py-1.5 text-xs font-mono rounded-lg border border-gray-200 dark:border-discord-dark-accent bg-gray-50 dark:bg-discord-dark-bg text-gray-900 dark:text-white focus:outline-none focus:border-discord-blurple"
                 />
               </div>
 
               {memberSearchWarning && (
                 <p className="text-[11px] text-amber-500/90 leading-tight">
-                  ℹ️ {memberSearchWarning}
+                  {memberSearchWarning}
                 </p>
               )}
             </div>
           )}
         </div>
 
-        {/* 2. Target Channels */}
+        {/* Channels Scope */}
         <div className="space-y-2 lg:col-span-1">
           <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-            2. Channels Scope ({selectedChannelIds.includes('all') ? 'All Accessible' : `${selectedChannelIds.length} Selected`})
+            Channel Scope ({selectedChannelIds.includes('all') ? 'All Accessible' : `${selectedChannelIds.length} Selected`})
           </label>
 
           <div className="relative">
@@ -319,28 +314,28 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
           </div>
         </div>
 
-        {/* 3. Date & Time Filters */}
+        {/* Date & Time Filters */}
         <div className="space-y-4 lg:col-span-1">
-          {/* Date Filter Mode */}
+          {/* Date Filter */}
           <div className="space-y-1.5">
             <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
               <Calendar className="w-3.5 h-3.5 text-discord-blurple" />
-              3. Date Boundary
+              Date Filter
             </label>
             <select
               value={dateMode}
               onChange={e => setDateMode(e.target.value as DateFilterMode)}
               className="w-full px-3 py-2 text-xs rounded-xl border border-gray-200 dark:border-discord-dark-accent bg-gray-50 dark:bg-discord-dark-bg text-gray-900 dark:text-white focus:outline-none focus:border-discord-blurple"
             >
-              <option value="ALL_TIME">All Time (Entire Message History)</option>
+              <option value="ALL_TIME">All Time (Full Message History)</option>
               <option value="BETWEEN_DATES">Date Range (Between Start &amp; End)</option>
-              <option value="SPECIFIC_DATE">Specific Date (Exact Day)</option>
-              <option value="BEFORE_DATE">Before Date (Strictly Older)</option>
-              <option value="AFTER_DATE">After Date (Strictly Newer)</option>
-              <option value="TODAY">Today Only</option>
-              <option value="YESTERDAY">Yesterday Only</option>
-              <option value="LAST_7_DAYS">Last 7 Days (Rolling)</option>
-              <option value="LAST_30_DAYS">Last 30 Days (Rolling)</option>
+              <option value="SPECIFIC_DATE">Specific Date</option>
+              <option value="BEFORE_DATE">Before Date</option>
+              <option value="AFTER_DATE">After Date</option>
+              <option value="TODAY">Today</option>
+              <option value="YESTERDAY">Yesterday</option>
+              <option value="LAST_7_DAYS">Last 7 Days</option>
+              <option value="LAST_30_DAYS">Last 30 Days</option>
             </select>
 
             {['BETWEEN_DATES', 'CUSTOM_RANGE'].includes(dateMode) && (
@@ -372,11 +367,11 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
             )}
           </div>
 
-          {/* Time Filter Mode */}
+          {/* Time Filter */}
           <div className="space-y-1.5">
             <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
               <Clock className="w-3.5 h-3.5 text-indigo-400" />
-              4. Time of Day Cutoff
+              Time Filter
             </label>
             <select
               value={timeMode}
@@ -384,9 +379,9 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
               className="w-full px-3 py-2 text-xs rounded-xl border border-gray-200 dark:border-discord-dark-accent bg-gray-50 dark:bg-discord-dark-bg text-gray-900 dark:text-white focus:outline-none focus:border-discord-blurple"
             >
               <option value="ANY_TIME">Any Time (24 Hours)</option>
-              <option value="AFTER_TIME">After Time (e.g. after 5:00 PM / 17:00)</option>
-              <option value="BEFORE_TIME">Before Time (e.g. before 12:00 PM)</option>
-              <option value="BETWEEN_TIMES">Time Window (Between Start &amp; End)</option>
+              <option value="AFTER_TIME">After Time</option>
+              <option value="BEFORE_TIME">Before Time</option>
+              <option value="BETWEEN_TIMES">Time Window</option>
             </select>
 
             {['AFTER_TIME', 'BEFORE_TIME'].includes(timeMode) && (
@@ -420,7 +415,6 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
         </div>
       </div>
 
-      {/* Action Bar */}
       <div className="pt-4 border-t border-gray-100 dark:border-discord-dark-accent flex justify-end">
         <button
           type="button"
@@ -431,12 +425,12 @@ export const FilterBuilderCard: React.FC<FilterBuilderCardProps> = ({
           {isScanning ? (
             <>
               <Loader2 className="w-4 h-4 animate-spin" />
-              <span>Scanning Discord Messages...</span>
+              <span>Scanning Messages...</span>
             </>
           ) : (
             <>
               <Search className="w-4 h-4" />
-              <span>Scan Messages Matching Filter</span>
+              <span>Scan Messages</span>
             </>
           )}
         </button>

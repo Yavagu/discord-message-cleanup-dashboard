@@ -4,17 +4,15 @@
  */
 
 export const DISCORD_API_BASE = 'https://discord.com/api/v10';
-export const DISCORD_USER_AGENT = 'DiscordCleanupDashboard/1.0 (Moderation Suite)';
+export const DISCORD_USER_AGENT = 'DiscordCleanupDashboard/2.0 (Moderation Suite)';
 
-// Hard Discord API bulk-delete limit is 14 days (336 hours). Discord rejects messages older than this with error 50034.
+// Hard Discord API bulk-delete limit is 14 days (336 hours). Messages older than 14 days must be deleted individually.
 export const DISCORD_BULK_DELETE_HARD_MAX_HOURS = 336;
 export const DISCORD_BULK_DELETE_HARD_MAX_DAYS = 14;
 
-// Operational maximum configurable threshold: 332 hours (~13.83 days).
-// Guarantees an immutable minimum 4-hour buffer to absorb clock skew and scan-to-delete latency.
-export const DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS = 332;
+export const DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS = 336;
 export const DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS = 24;
-export const DISCORD_BULK_DELETE_DEFAULT_SAFETY_HOURS = 332;
+export const DISCORD_BULK_DELETE_DEFAULT_HOURS = 336;
 
 export const DISCORD_BULK_DELETE_MIN_BATCH_SIZE = 2;
 export const DISCORD_BULK_DELETE_MAX_BATCH_SIZE = 100;

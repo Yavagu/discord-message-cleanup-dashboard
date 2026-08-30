@@ -6,7 +6,6 @@ import { DeletionService } from './deletion.service';
 import { logger } from '../utils/logger';
 
 export class JobService {
-  // Active SSE listeners keyed by jobId
   private static sseListeners = new Map<string, Set<Response>>();
 
   public static createJob(
@@ -50,10 +49,56 @@ export class JobService {
 
     logger.info(`Created cleanup job ${id} for target user ${targetUserId} in guild ${guildName}`);
 
-    return this.getJobById(id)!;
+    return this.getJobForSession(id, sessionId)!;
   }
 
-  public static getJobById(jobId: string): CleanupJob | null {
+  /**
+   * Retrieves a job ensuring strict session ownership.
+   */
+  public static getJobForSession(jobId: string, sessionId: string): CleanupJob | null {
+    const row = db.prepare('SELECT * FROM cleanup_jobs WHERE id = ? AND session_id = ?').get(jobId, sessionId) as any;
+    if (!row) return null;
+
+    let filterConfig: FilterConfig;
+    try {
+      filterConfig = JSON.parse(row.filter_config_json);
+    } catch {
+      filterConfig = {
+        targetUserId: row.target_user_id,
+        channelIds: [],
+        timezone: row.timezone,
+        dateMode: 'ALL_TIME',
+        timeMode: 'ANY_TIME'
+      };
+    }
+
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      status: row.status as JobStatus,
+      guildId: row.guild_id,
+      guildName: row.guild_name,
+      targetUserId: row.target_user_id,
+      targetUsername: row.target_username,
+      targetDisplayName: row.target_display_name,
+      targetAvatarUrl: row.target_avatar_url,
+      channelsJson: row.channels_json,
+      filterConfig,
+      timezone: row.timezone,
+      scannedCount: row.scanned_count || 0,
+      matchedCount: row.matched_count || 0,
+      selectedCount: row.selected_count || 0,
+      deletedCount: row.deleted_count || 0,
+      failedCount: row.failed_count || 0,
+      durationMs: row.duration_ms || 0,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      createdAt: row.created_at,
+      error: row.error_message
+    };
+  }
+
+  public static getJobByIdInternal(jobId: string): CleanupJob | null {
     const row = db.prepare('SELECT * FROM cleanup_jobs WHERE id = ?').get(jobId) as any;
     if (!row) return null;
 
@@ -104,7 +149,12 @@ export class JobService {
     `).run(status, error || null, jobId);
   }
 
-  public static registerSSEClient(jobId: string, res: Response): void {
+  public static registerSSEClientForSession(jobId: string, sessionId: string, res: Response): boolean {
+    const job = this.getJobForSession(jobId, sessionId);
+    if (!job) {
+      return false;
+    }
+
     if (!this.sseListeners.has(jobId)) {
       this.sseListeners.set(jobId, new Set());
     }
@@ -119,6 +169,8 @@ export class JobService {
         }
       }
     });
+
+    return true;
   }
 
   public static broadcastProgress(update: JobProgressUpdate): void {
@@ -135,8 +187,8 @@ export class JobService {
     }
   }
 
-  public static cancelJob(jobId: string): boolean {
-    const job = this.getJobById(jobId);
+  public static cancelJobForSession(jobId: string, sessionId: string): boolean {
+    const job = this.getJobForSession(jobId, sessionId);
     if (!job) return false;
 
     DeletionService.cancelJob(jobId);

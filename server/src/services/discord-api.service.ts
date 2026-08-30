@@ -27,18 +27,52 @@ export class DiscordApiError extends Error {
 
 interface BucketState {
   remaining: number;
-  resetAfterMs: number;
   resetTimestamp: number;
+  queue: Promise<void>;
 }
 
 export class DiscordApiService {
   private static globalResetTimestamp = 0;
-  private static bucketMap = new Map<string, BucketState>();
-  private static requestQueue: Promise<void> = Promise.resolve();
+  private static buckets = new Map<string, BucketState>();
+  private static routeToBucketIdentity = new Map<string, string>();
 
   /**
-   * Coordinated HTTP request execution with process-local rate limit queuing,
-   * exponential backoff with jitter on 5xx, and retry handling on 429.
+   * Extracts the Discord major resource parameter (channel_id, guild_id) and route pattern.
+   * In Discord's rate-limit architecture, rate-limit buckets are scoped to (bucket_hash, major_parameter).
+   */
+  private static parseRouteInfo(method: string, path: string): { routeKey: string; majorParam: string } {
+    const cleanPath = path.split('?')[0];
+
+    const channelMatch = cleanPath.match(/\/channels\/(\d+)/);
+    if (channelMatch) {
+      const channelId = channelMatch[1];
+      const majorParam = `channel:${channelId}`;
+      const routePattern = cleanPath.endsWith('/bulk-delete')
+        ? `${method}:/channels/:id/messages/bulk-delete`
+        : `${method}:/channels/:id/messages`;
+      return { routeKey: `${routePattern}:${majorParam}`, majorParam };
+    }
+
+    const guildMatch = cleanPath.match(/\/guilds\/(\d+)/);
+    if (guildMatch) {
+      const guildId = guildMatch[1];
+      const majorParam = `guild:${guildId}`;
+      let routePattern = `${method}:/guilds/:id`;
+      if (cleanPath.includes('/members')) {
+        routePattern = `${method}:/guilds/:id/members`;
+      } else if (cleanPath.includes('/channels')) {
+        routePattern = `${method}:/guilds/:id/channels`;
+      }
+      return { routeKey: `${routePattern}:${majorParam}`, majorParam };
+    }
+
+    return { routeKey: `${method}:${cleanPath}`, majorParam: 'top_level' };
+  }
+
+  /**
+   * Executes an HTTP request to the Discord API with rate-limit bucket scheduling
+   * scoped to (bucketHash, majorResource), proactive rate limit delay, global 429 locks,
+   * and exponential backoff on 5xx.
    */
   public static async request<T = any>(
     path: string,
@@ -46,9 +80,44 @@ export class DiscordApiService {
     options: DiscordRequestOptions = {}
   ): Promise<{ data: T; headers: Headers }> {
     const url = path.startsWith('http') ? path : `${DISCORD_API_BASE}${path}`;
+    const method = (options.method || 'GET').toUpperCase();
+    const { routeKey, majorParam } = this.parseRouteInfo(method, path);
+
+    // Derive effective bucket key combining learned bucket hash and major parameter
+    const effectiveBucketKey = this.routeToBucketIdentity.get(routeKey) || routeKey;
+
+    let bucket = this.buckets.get(effectiveBucketKey);
+    if (!bucket) {
+      bucket = {
+        remaining: 1,
+        resetTimestamp: 0,
+        queue: Promise.resolve()
+      };
+      this.buckets.set(effectiveBucketKey, bucket);
+    }
+
+    // Chain execution to serialize requests on the same rate limit bucket
+    const currentExecution = bucket.queue.then(async () => {
+      return this.executeWithRetry<T>(url, path, botToken, options, routeKey, majorParam, effectiveBucketKey);
+    });
+
+    // Update queue head without causing unhandled rejections in the chain
+    bucket.queue = currentExecution.then(() => {}, () => {});
+
+    return currentExecution;
+  }
+
+  private static async executeWithRetry<T>(
+    url: string,
+    path: string,
+    botToken: string,
+    options: DiscordRequestOptions,
+    routeKey: string,
+    majorParam: string,
+    initialBucketKey: string
+  ): Promise<{ data: T; headers: Headers }> {
     const maxRetries = options.maxRetries ?? 5;
     let attempt = 0;
-
     const sanitizedToken = botToken.startsWith('Bot ') ? botToken : `Bot ${botToken.trim()}`;
 
     while (attempt <= maxRetries) {
@@ -58,7 +127,16 @@ export class DiscordApiService {
       const now = Date.now();
       if (this.globalResetTimestamp > now) {
         const waitMs = this.globalResetTimestamp - now;
-        logger.info(`Discord API Global Rate Limit active: waiting ${waitMs}ms before next request`);
+        logger.info(`Discord API global rate limit active: waiting ${waitMs}ms`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+
+      // Check per-bucket quota and delay if remaining capacity is exhausted
+      const activeBucketKey = this.routeToBucketIdentity.get(routeKey) || initialBucketKey;
+      const bucket = this.buckets.get(activeBucketKey);
+      if (bucket && bucket.remaining <= 0 && bucket.resetTimestamp > Date.now()) {
+        const waitMs = Math.max(0, bucket.resetTimestamp - Date.now()) + 25;
+        logger.info(`Discord rate limit bucket ${activeBucketKey} exhausted: waiting ${waitMs}ms`);
         await new Promise(resolve => setTimeout(resolve, waitMs));
       }
 
@@ -78,22 +156,41 @@ export class DiscordApiService {
       try {
         const res = await fetch(url, fetchOptions);
 
-        // Update bucket tracking from response headers
+        // Update bucket metadata from response headers
         const bucketHeader = res.headers.get('X-RateLimit-Bucket');
         const remainingHeader = res.headers.get('X-RateLimit-Remaining');
         const resetAfterHeader = res.headers.get('X-RateLimit-Reset-After');
         const isGlobalHeader = res.headers.get('X-RateLimit-Global') === 'true';
 
-        if (bucketHeader && resetAfterHeader) {
-          const resetAfterMs = Math.ceil(parseFloat(resetAfterHeader) * 1000);
-          this.bucketMap.set(bucketHeader, {
-            remaining: remainingHeader ? parseInt(remainingHeader, 10) : 1,
-            resetAfterMs,
-            resetTimestamp: Date.now() + resetAfterMs
-          });
+        if (bucketHeader) {
+          // Scope bucket identity to (bucketHeader, majorParam)
+          const learnedBucketIdentity = `${bucketHeader}:${majorParam}`;
+          this.routeToBucketIdentity.set(routeKey, learnedBucketIdentity);
+
+          let targetBucket = this.buckets.get(learnedBucketIdentity);
+          if (!targetBucket) {
+            targetBucket = {
+              remaining: 1,
+              resetTimestamp: 0,
+              queue: Promise.resolve()
+            };
+            this.buckets.set(learnedBucketIdentity, targetBucket);
+          }
+          if (remainingHeader !== null) {
+            const parsedRemaining = parseInt(remainingHeader, 10);
+            if (!isNaN(parsedRemaining)) {
+              targetBucket.remaining = parsedRemaining;
+            }
+          }
+          if (resetAfterHeader !== null) {
+            const parsedResetAfter = parseFloat(resetAfterHeader);
+            if (!isNaN(parsedResetAfter)) {
+              targetBucket.resetTimestamp = Date.now() + Math.ceil(parsedResetAfter * 1000);
+            }
+          }
         }
 
-        // Handle 429 Rate Limit responses
+        // Handle 429 Rate Limits
         if (res.status === 429) {
           let retryAfterMs = 1000;
           let isGlobal429 = isGlobalHeader;
@@ -109,36 +206,44 @@ export class DiscordApiService {
           } catch {
             const headerRetry = res.headers.get('Retry-After');
             if (headerRetry) {
-              retryAfterMs = Math.ceil(parseFloat(headerRetry) * 1000);
+              const parsed = parseFloat(headerRetry);
+              if (!isNaN(parsed)) {
+                retryAfterMs = Math.ceil(parsed * 1000);
+              }
             }
           }
 
-          // Apply a safety padding of 100ms
-          retryAfterMs += 100;
+          retryAfterMs += 25;
 
           if (isGlobal429) {
             this.globalResetTimestamp = Date.now() + retryAfterMs;
-            logger.warn(`Discord API 429 GLOBAL Rate Limit: Pausing all requests for ${retryAfterMs}ms`);
+            logger.warn(`Discord API 429 global rate limit: pausing all requests for ${retryAfterMs}ms`);
           } else {
-            logger.warn(`Discord API 429 Route Rate Limit on ${path}: Pausing for ${retryAfterMs}ms (attempt ${attempt}/${maxRetries})`);
+            const currentActiveKey = this.routeToBucketIdentity.get(routeKey) || initialBucketKey;
+            const targetBucket = this.buckets.get(currentActiveKey);
+            if (targetBucket) {
+              targetBucket.remaining = 0;
+              targetBucket.resetTimestamp = Date.now() + retryAfterMs;
+            }
+            logger.warn(`Discord API 429 route rate limit on ${path}: waiting ${retryAfterMs}ms (attempt ${attempt}/${maxRetries})`);
           }
 
           if (attempt <= maxRetries) {
             await new Promise(resolve => setTimeout(resolve, retryAfterMs));
             continue;
-          } else {
-            throw new DiscordApiError(`Rate limit exceeded after ${maxRetries} retries`, 429, 429);
           }
+          throw new DiscordApiError(`Rate limit exceeded after ${maxRetries} retries`, 429, 429);
         }
 
-        // Handle 5xx Server Errors (Bounded Exponential Backoff with Jitter)
+        // Handle 5xx Server Errors with bounded exponential backoff and jitter
         if (res.status >= 500 && res.status < 600) {
           if (attempt <= maxRetries) {
             const backoffMs = Math.min(8000, 500 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 200);
-            logger.warn(`Discord API 5xx Server Error (${res.status}) on ${path}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
+            logger.warn(`Discord API 5xx error (${res.status}) on ${path}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
             await new Promise(resolve => setTimeout(resolve, backoffMs));
             continue;
           }
+          throw new DiscordApiError(`Discord API 5xx Server Error (${res.status}) after ${maxRetries} retries`, res.status);
         }
 
         // Handle 4xx Client Errors
@@ -160,7 +265,6 @@ export class DiscordApiService {
           throw new DiscordApiError(message, res.status, discordCode, rawBody);
         }
 
-        // 204 No Content
         if (res.status === 204) {
           return { data: null as any, headers: res.headers };
         }
@@ -172,7 +276,6 @@ export class DiscordApiService {
           throw err;
         }
 
-        // Transient network errors (DNS, TCP, timeout)
         if (attempt <= maxRetries) {
           const backoffMs = 500 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
           logger.warn(`Network error requesting ${path}: ${err.message}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
@@ -188,16 +291,13 @@ export class DiscordApiService {
   }
 
   /**
-   * Computes effective channel permissions following Discord's authoritative 8-step permission resolution algorithm:
-   * 1. Check Administrator flag on base guild permissions (bypasses all channel overwrites).
-   * 2. Start with guild base permissions (derived from @everyone and member's guild roles).
-   * 3. Apply @everyone role overwrite on channel: permissions = (permissions & ~deny) | allow.
-   * 4. Aggregate all member's role overwrites across the channel (combining denies and allows).
-   * 5. Apply aggregated role denies: permissions &= ~roleDenies.
-   * 6. Apply aggregated role allows: permissions |= roleAllows.
-   * 7. Apply member-specific deny (if present): permissions &= ~memberDeny.
-   * 8. Apply member-specific allow (if present): permissions |= memberAllow.
-   * 9. Invariant: If VIEW_CHANNEL is false, the channel is inaccessible (canView = canReadHistory = canManageMessages = false).
+   * Evaluates effective channel permissions following Discord's permission resolution hierarchy:
+   * 1. Administrator override grants all permissions unconditionally.
+   * 2. Base permissions derive from @everyone and member roles.
+   * 3. @everyone channel overwrite applies first.
+   * 4. Member role overwrites aggregate: role denies apply, then role allows apply.
+   * 5. Member-specific overwrite applies last (deny, then allow).
+   * 6. Visibility dependency: if VIEW_CHANNEL is denied, reading history and managing messages are denied.
    */
   public static computeChannelPermissions(
     baseGuildPermissions: bigint,
@@ -211,7 +311,6 @@ export class DiscordApiService {
     canManageMessages: boolean;
     rawPermissions: bigint;
   } {
-    // 1. Administrator Bypass
     if ((baseGuildPermissions & DiscordPermissions.ADMINISTRATOR) === DiscordPermissions.ADMINISTRATOR) {
       return {
         canView: true,
@@ -221,10 +320,8 @@ export class DiscordApiService {
       };
     }
 
-    // 2. Base permissions
     let permissions = baseGuildPermissions;
 
-    // 3. Apply @everyone role overwrite (type === 0, id === guildId)
     if (guildId && overwrites.length > 0) {
       const everyoneOverwrite = overwrites.find(o => o.id === guildId && o.type === 0);
       if (everyoneOverwrite) {
@@ -234,7 +331,6 @@ export class DiscordApiService {
       }
     }
 
-    // 4. Aggregate all member role overwrites
     let roleDenies = 0n;
     let roleAllows = 0n;
 
@@ -247,13 +343,9 @@ export class DiscordApiService {
       }
     }
 
-    // 5. Apply aggregated role denies
     permissions &= ~roleDenies;
-
-    // 6. Apply aggregated role allows
     permissions |= roleAllows;
 
-    // 7 & 8. Apply member-specific user overwrite (type === 1, id === memberUserId)
     if (memberUserId && overwrites.length > 0) {
       const memberOverwrite = overwrites.find(o => o.id === memberUserId && o.type === 1);
       if (memberOverwrite) {
@@ -264,11 +356,9 @@ export class DiscordApiService {
       }
     }
 
-    // 9. Evaluate specific flags with visibility hierarchy
     const canView = (permissions & DiscordPermissions.VIEW_CHANNEL) === DiscordPermissions.VIEW_CHANNEL;
 
     if (!canView) {
-      // If a bot/user cannot view a channel, reading history and managing messages are impossible
       return {
         canView: false,
         canReadHistory: false,
@@ -286,5 +376,14 @@ export class DiscordApiService {
       canManageMessages,
       rawPermissions: permissions
     };
+  }
+
+  /**
+   * Resets internal rate limit state (primarily used in test fixtures).
+   */
+  public static resetRateLimits(): void {
+    this.globalResetTimestamp = 0;
+    this.buckets.clear();
+    this.routeToBucketIdentity.clear();
   }
 }

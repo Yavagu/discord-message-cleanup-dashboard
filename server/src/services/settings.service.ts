@@ -1,7 +1,7 @@
 import { db } from '../db/database';
 import { AppSettings } from '../types';
 import {
-  DISCORD_BULK_DELETE_DEFAULT_SAFETY_HOURS,
+  DISCORD_BULK_DELETE_DEFAULT_HOURS,
   DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
   DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS,
   DISCORD_DEFAULT_PACING_MS,
@@ -12,7 +12,7 @@ import { logger } from '../utils/logger';
 
 const DEFAULT_SETTINGS: AppSettings = {
   pacingMs: DISCORD_DEFAULT_PACING_MS,
-  bulkCutoffHours: DISCORD_BULK_DELETE_DEFAULT_SAFETY_HOURS,
+  bulkCutoffHours: DISCORD_BULK_DELETE_DEFAULT_HOURS,
   requireDoubleConfirm: true,
   defaultTimezone: 'UTC',
   maxMessagesPerChannel: 1000
@@ -57,7 +57,7 @@ export class SettingsService {
           : DEFAULT_SETTINGS.requireDoubleConfirm,
         defaultTimezone: map.get('defaultTimezone') || DEFAULT_SETTINGS.defaultTimezone,
         maxMessagesPerChannel: map.has('maxMessagesPerChannel')
-          ? Math.max(100, Math.min(10000, Number(map.get('maxMessagesPerChannel'))))
+          ? Math.max(1, Math.min(10000, Number(map.get('maxMessagesPerChannel'))))
           : DEFAULT_SETTINGS.maxMessagesPerChannel,
         updatedAt: latestUpdate || new Date().toISOString()
       };
@@ -87,7 +87,7 @@ export class SettingsService {
         : current.requireDoubleConfirm,
       defaultTimezone: partial.defaultTimezone ? String(partial.defaultTimezone).trim() : current.defaultTimezone,
       maxMessagesPerChannel: partial.maxMessagesPerChannel !== undefined
-        ? Math.max(100, Math.min(10000, Math.round(Number(partial.maxMessagesPerChannel))))
+        ? Math.max(1, Math.min(10000, Math.round(Number(partial.maxMessagesPerChannel))))
         : current.maxMessagesPerChannel,
       updatedAt: new Date().toISOString()
     };
