@@ -68,19 +68,23 @@ A high-performance, professional moderation and bulk message purge dashboard for
 
 ## Screenshots
 
-> *Placeholder: Add screenshots of the Dashboard, Cleanup Builder, Preview Table, and Live Progress Modal here after deployment.*
+### 1. Operations Center & Dashboard Overview
+![Operations Center & Dashboard Overview](screenshots/dashboard.png)
 
-```
-+-----------------------------------------------------------------------------------+
-|  [ Discord Message Cleanup Dashboard ]                                            |
-|  +---------------------+ +-----------------------------------------------------+  |
-|  | Target User: Sam    | | Scanned: 523  |  Matched: 523  |  Selected: 497     |  |
-|  | Channel: #general   | | Timezone: Asia/Kolkata (IST)                        |  |
-|  | Mode: After 5:00 PM | | Status: Scan Complete - Ready for Purge             |  |
-|  +---------------------+ +-----------------------------------------------------+  |
-|  [ Preview Messages ] [ Select All ] [ Deselect All ]      [ Execute Purge (497) ]|
-+-----------------------------------------------------------------------------------+
-```
+### 2. Multi-Criteria Message Cleanup Builder
+![Message Cleanup Builder](screenshots/cleanup-builder.png)
+
+### 3. Bot Configuration & Channel / Gateway Intent Audit
+![Bot Configuration & Auditing](screenshots/bot-config.png)
+
+### 4. Persistent Cleanup Audit History
+![Cleanup Audit History](screenshots/cleanup-history.png)
+
+### 5. Interactive Message Preview & Selection Table
+> *Placeholder: Interactive message inspection modal and preview table (Slot 5).*
+
+### 6. Real-Time SSE Purge Execution & Failure Breakdown
+> *Placeholder: Live deletion progress bar, rate-limit pacing ETA, and error reporting (Slot 6).*
 
 ---
 
