@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply font-sans transition-colors duration-200 bg-gray-100 dark:bg-discord-dark-bg text-gray-900 dark:text-discord-dark-text;
+  }
+}
+
+/* Custom modern scrollbars matching Discord palette */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 dark:bg-discord-dark-accent rounded-full hover:bg-gray-400 dark:hover:bg-discord-dark-hover;
+}
+
+/* Subtle glow effects matching Discord Blurple #7289da */
+.glow-blurple {
+  box-shadow: 0 0 20px -5px rgba(114, 137, 218, 0.45);
+}
+
+.glow-red {
+  box-shadow: 0 0 20px -5px rgba(240, 71, 71, 0.45);
+}
+
+.glow-green {
+  box-shadow: 0 0 20px -5px rgba(67, 181, 129, 0.45);
+}
