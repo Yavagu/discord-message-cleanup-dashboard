@@ -190,8 +190,8 @@ export interface AdminSession {
   csrfToken: string;
   isDemo: boolean;
   botToken?: string; // in-memory session only
-  createdAt: number;
-  expiresAt: number;
+  createdAt: string;
+  expiresAt: string;
 }
 
 export interface AppSettings {

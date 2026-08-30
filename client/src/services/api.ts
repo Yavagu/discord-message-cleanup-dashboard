@@ -109,10 +109,11 @@ export const api = {
     }>(`/api/jobs/${jobId}?${query.toString()}`);
   },
 
-  deleteJobMessages: (jobId: string, selectedMessageIds?: string[]) => request<{ success: boolean; message: string; jobId: string }>(`/api/jobs/${jobId}/delete`, {
-    method: 'POST',
-    body: JSON.stringify({ selectedMessageIds })
-  }),
+  deleteJobMessages: (jobId: string, selectedMessageIds?: string[], confirmed = true) =>
+    request<{ success: boolean; message: string; jobId: string }>(`/api/jobs/${jobId}/delete`, {
+      method: 'POST',
+      body: JSON.stringify({ selectedMessageIds, confirmed })
+    }),
 
   cancelJob: (jobId: string) => request<{ success: boolean }>(`/api/jobs/${jobId}/cancel`, {
     method: 'POST'

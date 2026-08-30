@@ -2,7 +2,11 @@ import { db } from '../db/database';
 import { AppSettings } from '../types';
 import {
   DISCORD_BULK_DELETE_DEFAULT_SAFETY_HOURS,
-  DISCORD_DEFAULT_PACING_MS
+  DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
+  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS,
+  DISCORD_DEFAULT_PACING_MS,
+  DISCORD_MAX_PACING_MS,
+  DISCORD_MIN_PACING_MS
 } from '../constants/discord.constants';
 import { logger } from '../utils/logger';
 
@@ -33,7 +37,6 @@ export class SettingsService {
       }>;
 
       if (rows.length === 0) {
-        // Initialize default settings in SQLite
         this.saveSettingsToDb(DEFAULT_SETTINGS);
         this.cachedSettings = { ...DEFAULT_SETTINGS };
         return { ...DEFAULT_SETTINGS };
@@ -43,11 +46,19 @@ export class SettingsService {
       const latestUpdate = rows.reduce((latest, r) => (r.updated_at > latest ? r.updated_at : latest), '');
 
       const settings: AppSettings = {
-        pacingMs: map.has('pacingMs') ? Math.max(25, Math.min(2000, Number(map.get('pacingMs')))) : DEFAULT_SETTINGS.pacingMs,
-        bulkCutoffHours: map.has('bulkCutoffHours') ? Math.max(24, Math.min(336, Number(map.get('bulkCutoffHours')))) : DEFAULT_SETTINGS.bulkCutoffHours,
-        requireDoubleConfirm: map.has('requireDoubleConfirm') ? map.get('requireDoubleConfirm') === 'true' : DEFAULT_SETTINGS.requireDoubleConfirm,
+        pacingMs: map.has('pacingMs')
+          ? Math.max(DISCORD_MIN_PACING_MS, Math.min(DISCORD_MAX_PACING_MS, Number(map.get('pacingMs'))))
+          : DEFAULT_SETTINGS.pacingMs,
+        bulkCutoffHours: map.has('bulkCutoffHours')
+          ? Math.max(DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS, Math.min(DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS, Number(map.get('bulkCutoffHours'))))
+          : DEFAULT_SETTINGS.bulkCutoffHours,
+        requireDoubleConfirm: map.has('requireDoubleConfirm')
+          ? map.get('requireDoubleConfirm') === 'true'
+          : DEFAULT_SETTINGS.requireDoubleConfirm,
         defaultTimezone: map.get('defaultTimezone') || DEFAULT_SETTINGS.defaultTimezone,
-        maxMessagesPerChannel: map.has('maxMessagesPerChannel') ? Math.max(100, Math.min(10000, Number(map.get('maxMessagesPerChannel')))) : DEFAULT_SETTINGS.maxMessagesPerChannel,
+        maxMessagesPerChannel: map.has('maxMessagesPerChannel')
+          ? Math.max(100, Math.min(10000, Number(map.get('maxMessagesPerChannel'))))
+          : DEFAULT_SETTINGS.maxMessagesPerChannel,
         updatedAt: latestUpdate || new Date().toISOString()
       };
 
@@ -66,10 +77,10 @@ export class SettingsService {
     const current = this.getSettings();
     const updated: AppSettings = {
       pacingMs: partial.pacingMs !== undefined
-        ? Math.max(25, Math.min(2000, Math.round(Number(partial.pacingMs))))
+        ? Math.max(DISCORD_MIN_PACING_MS, Math.min(DISCORD_MAX_PACING_MS, Math.round(Number(partial.pacingMs))))
         : current.pacingMs,
       bulkCutoffHours: partial.bulkCutoffHours !== undefined
-        ? Math.max(24, Math.min(336, Number(partial.bulkCutoffHours)))
+        ? Math.max(DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS, Math.min(DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS, Number(partial.bulkCutoffHours)))
         : current.bulkCutoffHours,
       requireDoubleConfirm: partial.requireDoubleConfirm !== undefined
         ? Boolean(partial.requireDoubleConfirm)

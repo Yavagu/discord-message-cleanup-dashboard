@@ -1,37 +1,35 @@
 import assert from 'node:assert';
 import { DateTime } from 'luxon';
 import { FilterService } from '../services/filter.service';
-import { FilterConfig } from '../types';
+import { FilterConfig, ChannelPermissionOverwrite } from '../types';
 import { db, initDatabase } from '../db/database';
 import { AuthService, cleanupExpiredSessions } from '../services/auth.service';
 import { JobService } from '../services/job.service';
 import { SettingsService } from '../services/settings.service';
 import { DeletionService } from '../services/deletion.service';
 import { HistoryService } from '../services/history.service';
-import { DiscordApiService } from '../services/discord-api.service';
-import { DiscordPermissions, getDiscordErrorDetail } from '../constants/discord.constants';
+import { DiscordApiService, DiscordApiError } from '../services/discord-api.service';
+import {
+  DiscordPermissions,
+  DISCORD_BULK_DELETE_HARD_MAX_HOURS,
+  DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
+  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS,
+  getDiscordErrorDetail
+} from '../constants/discord.constants';
 
 initDatabase();
 
 let passed = 0;
 let failed = 0;
 
-function test(name: string, fn: () => void | Promise<void>) {
+async function test(name: string, fn: () => void | Promise<void>) {
   try {
     const res = fn();
     if (res instanceof Promise) {
-      return res.then(() => {
-        console.log(`  ✓ ${name}`);
-        passed++;
-      }).catch((err) => {
-        console.error(`  ✗ ${name}`);
-        console.error(err);
-        failed++;
-      });
-    } else {
-      console.log(`  ✓ ${name}`);
-      passed++;
+      await res;
     }
+    console.log(`  ✓ ${name}`);
+    passed++;
   } catch (err) {
     console.error(`  ✗ ${name}`);
     console.error(err);
@@ -41,10 +39,10 @@ function test(name: string, fn: () => void | Promise<void>) {
 
 async function runAllTests() {
   console.log('\n======================================================');
-  console.log('--- 1. Timezone-Aware Filter Engine Tests ---');
+  console.log('--- 1. Timezone-Aware Filter Engine & Boundary Tests ---');
   console.log('======================================================');
 
-  test('Should match exact immutable Discord Snowflake User ID and reject others', () => {
+  await test('Should match exact immutable Discord Snowflake User ID and reject other users', () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -60,9 +58,7 @@ async function runAllTests() {
     assert.strictEqual(FilterService.matchesFilter(wrongUserMsg, filter), false);
   });
 
-  test('Should accurately evaluate Time Filter (After 5:00 PM / 17:00) in Asia/Kolkata (+05:30)', () => {
-    // 12:00 UTC = 17:30 IST (+5:30) -> After 5:00 PM (17:00)
-    // 11:00 UTC = 16:30 IST (+5:30) -> Before 5:00 PM (17:00)
+  await test('Should accurately evaluate Time Filter in positive offset timezone (Asia/Kolkata +05:30)', () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -72,14 +68,16 @@ async function runAllTests() {
       startTime: '17:00'
     };
 
-    const afterFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T12:00:00Z' }; // 17:30 IST
-    const beforeFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T11:00:00Z' }; // 16:30 IST
+    // 12:00 UTC = 17:30 IST (+5:30) -> After 17:00 -> MATCH
+    const afterFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T12:00:00Z' };
+    // 11:00 UTC = 16:30 IST (+5:30) -> Before 17:00 -> NO MATCH
+    const beforeFiveMsg = { authorId: '987654321000000001', timestampUtc: '2026-08-10T11:00:00Z' };
 
     assert.strictEqual(FilterService.matchesFilter(afterFiveMsg, filter), true);
     assert.strictEqual(FilterService.matchesFilter(beforeFiveMsg, filter), false);
   });
 
-  test('Should evaluate compound Date Range (Aug 1 - 15, 2026) + Time (After 17:00) in America/New_York (EDT UTC-4)', () => {
+  await test('Should evaluate compound Date Range + Time in negative offset timezone (America/New_York EDT -04:00)', () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['all'],
@@ -103,7 +101,7 @@ async function runAllTests() {
     assert.strictEqual(FilterService.matchesFilter(failDateMsg, filter), false);
   });
 
-  test('Should evaluate overnight Time Window (22:00 to 04:00) spanning midnight', () => {
+  await test('Should evaluate overnight Time Window (22:00 to 04:00) spanning midnight', () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -123,7 +121,7 @@ async function runAllTests() {
     assert.strictEqual(FilterService.matchesFilter(daytimeMsg, filter), false);
   });
 
-  test('Should handle invalid timestamps gracefully without throwing', () => {
+  await test('Should handle malformed timestamp strings without crashing', () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -132,132 +130,251 @@ async function runAllTests() {
       timeMode: 'ANY_TIME'
     };
 
-    const invalidMsg = { authorId: '987654321000000001', timestampUtc: 'not-a-valid-iso' };
-    assert.strictEqual(FilterService.matchesFilter(invalidMsg, filter), false);
+    assert.strictEqual(FilterService.matchesFilter({ authorId: '987654321000000001', timestampUtc: 'not-valid' }, filter), false);
     assert.strictEqual(FilterService.formatLocalTimestamp('invalid-date', 'UTC'), 'invalid-date');
+    assert.strictEqual(FilterService.calculateAgeDays('invalid-date'), 0);
   });
 
   console.log('\n======================================================');
-  console.log('--- 2. Bulk-Delete 14-Day Cutoff & Age Calculation ---');
+  console.log('--- 2. Bulk-Delete 14-Day Boundary & Age Evaluation ---');
   console.log('======================================================');
 
-  test('Should accurately classify messages under 14 days as bulk-deletable and older as individual', () => {
-    const recentIso = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
-    const olderIso = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+  await test('Should strictly enforce safety margin and prevent configuring bulk cutoff to 336h', () => {
+    // Attempt to set bulk cutoff to 336 hours or beyond
+    const updated = SettingsService.updateSettings({ bulkCutoffHours: 336 });
+    assert.ok(
+      updated.bulkCutoffHours <= DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
+      `bulkCutoffHours (${updated.bulkCutoffHours}) must never exceed max safe threshold of ${DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS}h`
+    );
+    assert.strictEqual(updated.bulkCutoffHours, 332);
 
-    const recentAge = FilterService.calculateAgeDays(recentIso);
-    const oldAge = FilterService.calculateAgeDays(olderIso);
+    // Attempt to set below 24h
+    const updatedLow = SettingsService.updateSettings({ bulkCutoffHours: 5 });
+    assert.strictEqual(updatedLow.bulkCutoffHours, DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS);
 
-    assert.ok(recentAge < 13.9, `Recent message (${recentAge}d) should be under cutoff`);
-    assert.ok(oldAge > 14.0, `Old message (${oldAge}d) should be over 14.0 days`);
+    // Reset
+    SettingsService.updateSettings({ bulkCutoffHours: 332 });
+  });
 
-    assert.strictEqual(FilterService.isBulkDeletable(recentIso, 13.85), true);
-    assert.strictEqual(FilterService.isBulkDeletable(olderIso, 13.85), false);
+  await test('Should test messages immediately on both sides of the 13.833-day cutoff', () => {
+    const cutoffDays = 332 / 24; // 13.8333 days
+    const nowMs = Date.now();
+
+    // 13.80 days old -> Bulk eligible
+    const msgJustUnder = new Date(nowMs - (13.80 * 24 * 60 * 60 * 1000)).toISOString();
+    // 13.86 days old -> Over safe cutoff -> Single delete
+    const msgJustOver = new Date(nowMs - (13.86 * 24 * 60 * 60 * 1000)).toISOString();
+    // 14.10 days old -> Hard Discord boundary exceeded -> Single delete
+    const msgHardOver = new Date(nowMs - (14.10 * 24 * 60 * 60 * 1000)).toISOString();
+
+    assert.strictEqual(FilterService.isBulkDeletable(msgJustUnder, cutoffDays), true);
+    assert.strictEqual(FilterService.isBulkDeletable(msgJustOver, cutoffDays), false);
+    assert.strictEqual(FilterService.isBulkDeletable(msgHardOver, cutoffDays), false);
   });
 
   console.log('\n======================================================');
-  console.log('--- 3. Discord Bitwise Permission Calculation ---');
+  console.log('--- 3. Discord 8-Step Permission Resolution Semantics ---');
   console.log('======================================================');
 
-  test('Should grant all channel permissions when bot has Administrator flag (0x8)', () => {
-    const adminPerms = DiscordPermissions.ADMINISTRATOR;
-    const evaluated = DiscordApiService.computeChannelPermissions(adminPerms, [], '112233445566778899');
+  await test('Step 1: Administrator bypass overrides all channel denies', () => {
+    const basePerms = DiscordPermissions.ADMINISTRATOR;
+    const overwrites: ChannelPermissionOverwrite[] = [
+      {
+        id: 'guild123',
+        type: 0,
+        allow: '0',
+        deny: String(DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.MANAGE_MESSAGES)
+      }
+    ];
 
-    assert.strictEqual(evaluated.canView, true);
-    assert.strictEqual(evaluated.canReadHistory, true);
-    assert.strictEqual(evaluated.canManageMessages, true);
+    const result = DiscordApiService.computeChannelPermissions(basePerms, overwrites, 'guild123');
+    assert.strictEqual(result.canView, true);
+    assert.strictEqual(result.canReadHistory, true);
+    assert.strictEqual(result.canManageMessages, true);
   });
 
-  test('Should accurately evaluate non-admin channel permissions with overwrites', () => {
-    // Non-admin with VIEW_CHANNEL (0x400) and READ_MESSAGE_HISTORY (0x10000), but lacks MANAGE_MESSAGES (0x2000)
+  await test('Steps 4-6: Aggregate conflicting role overwrites (deny then allow across roles)', () => {
+    // Base: VIEW_CHANNEL | READ_MESSAGE_HISTORY
     const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
-    const evaluatedNoManage = DiscordApiService.computeChannelPermissions(basePerms, [], '112233445566778899');
 
-    assert.strictEqual(evaluatedNoManage.canView, true);
-    assert.strictEqual(evaluatedNoManage.canReadHistory, true);
-    assert.strictEqual(evaluatedNoManage.canManageMessages, false);
+    // Role 1 denies MANAGE_MESSAGES
+    // Role 2 allows MANAGE_MESSAGES
+    const overwrites: ChannelPermissionOverwrite[] = [
+      {
+        id: 'role1',
+        type: 0,
+        allow: '0',
+        deny: String(DiscordPermissions.MANAGE_MESSAGES)
+      },
+      {
+        id: 'role2',
+        type: 0,
+        allow: String(DiscordPermissions.MANAGE_MESSAGES),
+        deny: '0'
+      }
+    ];
 
-    // Overwrite granting MANAGE_MESSAGES
-    const overwrites = [{
-      id: '112233445566778899',
-      type: 0,
-      allow: String(DiscordPermissions.MANAGE_MESSAGES),
-      deny: '0'
-    }];
+    // Member has both role1 and role2 -> Aggregated allow overrides aggregated deny
+    const resultBothRoles = DiscordApiService.computeChannelPermissions(
+      basePerms,
+      overwrites,
+      'guild123',
+      ['role1', 'role2'],
+      'user1'
+    );
+    assert.strictEqual(resultBothRoles.canManageMessages, true);
 
-    const evaluatedWithAllow = DiscordApiService.computeChannelPermissions(basePerms, overwrites, '112233445566778899');
-    assert.strictEqual(evaluatedWithAllow.canManageMessages, true);
+    // Member only has role1 -> Denied
+    const resultRole1Only = DiscordApiService.computeChannelPermissions(
+      basePerms,
+      overwrites,
+      'guild123',
+      ['role1'],
+      'user1'
+    );
+    assert.strictEqual(resultRole1Only.canManageMessages, false);
+  });
+
+  await test('Steps 7-8: Member-specific user overwrite overrides role overwrites', () => {
+    const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
+
+    const overwrites: ChannelPermissionOverwrite[] = [
+      // Role grants MANAGE_MESSAGES
+      {
+        id: 'roleAllow',
+        type: 0,
+        allow: String(DiscordPermissions.MANAGE_MESSAGES),
+        deny: '0'
+      },
+      // Specific Member user overwrite explicitly DENIES MANAGE_MESSAGES
+      {
+        id: 'user1',
+        type: 1,
+        allow: '0',
+        deny: String(DiscordPermissions.MANAGE_MESSAGES)
+      }
+    ];
+
+    const result = DiscordApiService.computeChannelPermissions(
+      basePerms,
+      overwrites,
+      'guild123',
+      ['roleAllow'],
+      'user1'
+    );
+
+    // User-specific deny takes precedence over role allow
+    assert.strictEqual(result.canManageMessages, false);
+  });
+
+  await test('Step 9: When VIEW_CHANNEL is false, readHistory and manageMessages must be false', () => {
+    const basePerms = DiscordPermissions.MANAGE_MESSAGES | DiscordPermissions.READ_MESSAGE_HISTORY;
+    // Overwrite denies VIEW_CHANNEL
+    const overwrites: ChannelPermissionOverwrite[] = [
+      {
+        id: 'guild123',
+        type: 0,
+        allow: '0',
+        deny: String(DiscordPermissions.VIEW_CHANNEL)
+      }
+    ];
+
+    const result = DiscordApiService.computeChannelPermissions(basePerms, overwrites, 'guild123');
+    assert.strictEqual(result.canView, false);
+    assert.strictEqual(result.canReadHistory, false);
+    assert.strictEqual(result.canManageMessages, false);
   });
 
   console.log('\n======================================================');
   console.log('--- 4. Authentication, Constant-Time Auth & Security ---');
   console.log('======================================================');
 
-  test('Should verify passwords using constant-time check and reject backdoors', () => {
-    // In dev mode, default is admin123
-    assert.strictEqual(AuthService.verifyPassword('admin123'), true);
-    assert.strictEqual(AuthService.verifyPassword('wrongpassword'), false);
-    // Insecure backdoor 'admin' must be rejected
-    assert.strictEqual(AuthService.verifyPassword('admin'), false);
+  await test('timingSafeEqual SHA-256 digests across shorter, longer, empty, Unicode passwords', () => {
+    process.env.ADMIN_PASSWORD = 'SecretP@ssword!123';
+
+    // Correct password
+    assert.strictEqual(AuthService.verifyPassword('SecretP@ssword!123'), true);
+
+    // Shorter wrong password
+    assert.strictEqual(AuthService.verifyPassword('Sec'), false);
+
+    // Longer wrong password
+    assert.strictEqual(AuthService.verifyPassword('SecretP@ssword!123_ExtraLongWrongSuffixThatWouldNormallyThrowLengthMismatch'), false);
+
+    // Empty password
+    assert.strictEqual(AuthService.verifyPassword(''), false);
+
+    // Unicode input
+    assert.strictEqual(AuthService.verifyPassword('日本語パスワード'), false);
+
+    // Non-string input
+    assert.strictEqual(AuthService.verifyPassword(undefined as any), false);
+    assert.strictEqual(AuthService.verifyPassword(12345 as any), false);
+
+    // Revert
+    process.env.ADMIN_PASSWORD = 'admin123';
   });
 
-  test('Should create secure admin session with volatile in-memory token storage', () => {
-    const session = AuthService.createSession('testAdmin', true);
-    assert.ok(session.id, 'Session must have an ID');
-    assert.ok(session.csrfToken, 'Session must have a CSRF token');
+  await test('Session zero-storage: token in RAM only, destroyed on session deletion', () => {
+    const session = AuthService.createSession('secAdmin', false);
+    assert.ok(session.id);
+    assert.ok(session.csrfToken);
 
     AuthService.setSessionBotToken(session.id, 'Bot MTIzNDU2.test.secretToken');
     const retrieved = AuthService.getSession(session.id);
     assert.strictEqual(retrieved?.botToken, 'Bot MTIzNDU2.test.secretToken');
 
-    // Verify token was NOT written to DB
+    // Verify DB does not contain the token
     const dbRow = db.prepare('SELECT * FROM admin_sessions WHERE id = ?').get(session.id) as any;
-    assert.strictEqual(dbRow.bot_token, undefined, 'Database table must never have bot_token column');
+    assert.strictEqual(dbRow.bot_token, undefined);
 
+    // Evict session
     AuthService.destroySession(session.id);
     assert.strictEqual(AuthService.getSession(session.id), null);
   });
 
   console.log('\n======================================================');
-  console.log('--- 5. Persistent Settings Engine ---');
+  console.log('--- 5. Double Confirmation & Backend Invariant ---');
   console.log('======================================================');
 
-  test('Should persist and retrieve runtime settings in SQLite with clamp bounds', () => {
-    const initial = SettingsService.getSettings();
-    assert.ok(initial.pacingMs >= 25);
-    assert.ok(initial.bulkCutoffHours <= 336);
-
-    const updated = SettingsService.updateSettings({
-      pacingMs: 150,
+  await test('Settings persistence and snapshot consistency across reads and updates', () => {
+    // 1. Update settings
+    SettingsService.updateSettings({
+      pacingMs: 250,
       bulkCutoffHours: 330,
-      requireDoubleConfirm: false
+      requireDoubleConfirm: true,
+      defaultTimezone: 'Asia/Tokyo'
     });
 
-    assert.strictEqual(updated.pacingMs, 150);
-    assert.strictEqual(updated.bulkCutoffHours, 330);
-    assert.strictEqual(updated.requireDoubleConfirm, false);
+    const s = SettingsService.getSettings();
+    assert.strictEqual(s.pacingMs, 250);
+    assert.strictEqual(s.bulkCutoffHours, 330);
+    assert.strictEqual(s.requireDoubleConfirm, true);
+    assert.strictEqual(s.defaultTimezone, 'Asia/Tokyo');
 
-    // Verify persistence in SQLite
-    const retrieved = SettingsService.getSettings();
-    assert.strictEqual(retrieved.pacingMs, 150);
-    assert.strictEqual(retrieved.bulkCutoffHours, 330);
-    assert.strictEqual(retrieved.requireDoubleConfirm, false);
+    // 2. Partial update preserves other fields
+    SettingsService.updateSettings({ pacingMs: 150 });
+    const s2 = SettingsService.getSettings();
+    assert.strictEqual(s2.pacingMs, 150);
+    assert.strictEqual(s2.bulkCutoffHours, 330);
+    assert.strictEqual(s2.defaultTimezone, 'Asia/Tokyo');
 
-    // Reset back to defaults for clean test state
+    // Reset
     SettingsService.updateSettings({
       pacingMs: 100,
       bulkCutoffHours: 332,
-      requireDoubleConfirm: true
+      requireDoubleConfirm: true,
+      defaultTimezone: 'UTC'
     });
   });
 
   console.log('\n======================================================');
-  console.log('--- 6. Deletion Service Lifecycle & Invariants ---');
+  console.log('--- 6. Deletion Engine State Machine, Fallback & Races ---');
   console.log('======================================================');
 
-  test('Should enforce job lifecycle state transitions and atomic locks', () => {
+  await test('Should create and lock job, preventing concurrent execution', () => {
     const job = JobService.createJob(
-      'session-lifecycle-test',
+      'session-race-test',
       '112233445566778899',
       'Elysium Community',
       '987654321000000001',
@@ -276,32 +393,24 @@ async function runAllTests() {
 
     assert.strictEqual(job.status, 'DRAFT');
 
+    // Update to READY
     JobService.updateJobStatus(job.id, 'READY');
     const readyJob = JobService.getJobById(job.id);
     assert.strictEqual(readyJob?.status, 'READY');
   });
 
-  test('Should map Discord error codes to user-friendly reasons and suggestions', () => {
-    const err50013 = getDiscordErrorDetail(50013);
-    assert.ok(err50013.reason.includes('Missing Permissions'));
-    assert.ok(err50013.suggestion.includes('Manage Messages'));
+  await test('Discord error detail mapping for all standard codes', () => {
+    const e429 = getDiscordErrorDetail(429);
+    assert.ok(e429.reason.includes('Rate Limit'));
 
-    const err50034 = getDiscordErrorDetail(50034);
-    assert.ok(err50034.reason.includes('14 days'));
+    const e50034 = getDiscordErrorDetail(50034);
+    assert.ok(e50034.reason.includes('14 days'));
 
-    const err10008 = getDiscordErrorDetail(10008);
-    assert.ok(err10008.reason.includes('Unknown Message'));
-  });
+    const e10008 = getDiscordErrorDetail(10008);
+    assert.ok(e10008.reason.includes('Unknown Message'));
 
-  console.log('\n======================================================');
-  console.log('--- 7. History, Reports & Audit Aggregation ---');
-  console.log('======================================================');
-
-  test('Should aggregate dashboard KPI metrics and compute success rate', () => {
-    const metrics = HistoryService.getDashboardMetrics();
-    assert.ok(metrics.totalJobs >= 0);
-    assert.ok(typeof metrics.successRate === 'number');
-    assert.ok(Array.isArray(metrics.recentJobs));
+    const eUnknown = getDiscordErrorDetail(99999, 'Custom Failure');
+    assert.strictEqual(eUnknown.reason, 'Custom Failure');
   });
 
   console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

@@ -3,6 +3,7 @@ import { CleanupFailure, JobProgressUpdate, JobStatus } from '../types';
 import { deleteMockMessage } from './mock.service';
 import { DiscordApiService, DiscordApiError } from './discord-api.service';
 import { SettingsService } from './settings.service';
+import { FilterService } from './filter.service';
 import {
   DISCORD_BULK_DELETE_MAX_BATCH_SIZE,
   DISCORD_BULK_DELETE_MIN_BATCH_SIZE,
@@ -32,7 +33,8 @@ export class DeletionService {
   }
 
   /**
-   * Revalidate deletion payload against SQLite job records and execute deletion
+   * Revalidates deletion payload against SQLite job records and executes deletion
+   * with live age re-evaluation against runtime bulk cutoff snapshot.
    */
   public static async executeDeletion(
     jobId: string,
@@ -51,11 +53,12 @@ export class DeletionService {
   }> {
     this.clearCancellation(jobId);
     const startTime = Date.now();
+
+    // 1. Capture coherent settings snapshot at execution start
     const pacingMs = SettingsService.getPacingMs();
     const bulkCutoffDays = SettingsService.getBulkCutoffDays();
 
-    // 1. Backend Server-Side Revalidation
-    // Verify job exists, belongs to session, and is in READY state
+    // 2. Backend Server-Side Revalidation
     const job = db.prepare(`
       SELECT * FROM cleanup_jobs WHERE id = ? AND session_id = ?
     `).get(jobId, sessionId) as any;
@@ -79,13 +82,13 @@ export class DeletionService {
 
     const scannedMap = new Map<string, any>(scannedRows.map(r => [r.message_id, r]));
 
-    // Determine target messages to delete
+    // Deduplicate and revalidate target message IDs against scanned results
     let targetRows: any[] = [];
     if (!selectedMessageIds || selectedMessageIds.length === 0) {
       targetRows = scannedRows;
     } else {
-      // Revalidate that EVERY requested message ID was part of the original scan
-      for (const msgId of selectedMessageIds) {
+      const uniqueIds = Array.from(new Set(selectedMessageIds));
+      for (const msgId of uniqueIds) {
         const item = scannedMap.get(msgId);
         if (!item) {
           throw new Error(`Security rejection: Message ID ${msgId} was not part of the scanned results for job ${jobId}`);
@@ -94,7 +97,7 @@ export class DeletionService {
       }
     }
 
-    // 2. Atomic Job Lock: Transition READY -> DELETING
+    // 3. Atomic Job Lock: Transition READY -> DELETING
     const lockResult = db.prepare(`
       UPDATE cleanup_jobs
       SET status = 'DELETING', started_at = ?, selected_count = ?
@@ -105,7 +108,7 @@ export class DeletionService {
       throw new Error('Conflict: Cleanup job is already being processed or is not in READY state');
     }
 
-    logger.info(`Job ${jobId} locked and transitioning to DELETING (${targetRows.length} messages, pacing: ${pacingMs}ms)`);
+    logger.info(`Job ${jobId} locked and transitioning to DELETING (${targetRows.length} messages, pacing: ${pacingMs}ms, cutoff: ${bulkCutoffDays.toFixed(2)}d)`);
 
     const totalSelected = targetRows.length;
     let deletedCount = 0;
@@ -149,32 +152,34 @@ export class DeletionService {
 
     emitProgress();
 
-    // 3. Process Deletions per channel
+    // 4. Process Deletions per channel
     for (const [channelId, msgs] of channelMap.entries()) {
       if (this.isCancelled(jobId)) {
-        logger.info(`Job ${jobId} was cancelled by administrator`);
+        logger.info(`Job ${jobId} cancelled before channel ${channelId}`);
         break;
       }
 
       const channelName = msgs[0]?.channel_name || channelId;
 
-      // Segment messages based on active bulk delete cutoff threshold
+      // Re-evaluate live message age against current UTC time to prevent race conditions
+      // where a message aged past the 14-day cutoff between scanning and execution
       const bulkEligible: any[] = [];
       const individualOnly: any[] = [];
 
       for (const m of msgs) {
-        if (m.age_days <= bulkCutoffDays) {
+        const liveAgeDays = FilterService.calculateAgeDays(m.timestamp_utc);
+        if (liveAgeDays <= bulkCutoffDays) {
           bulkEligible.push(m);
         } else {
           individualOnly.push(m);
         }
       }
 
-      // --- 3A. Process Bulk Deletions (batches of 2 to 100) ---
+      // --- 4A. Process Bulk Deletions (batches of 2 to 100) ---
       while (bulkEligible.length > 0) {
         if (this.isCancelled(jobId)) break;
 
-        // If only 1 message remains, Discord bulk delete rejects it (min 2 messages); route to single delete
+        // If only 1 message remains in bulk list, Discord bulk delete rejects it (min 2); route to single delete
         if (bulkEligible.length < DISCORD_BULK_DELETE_MIN_BATCH_SIZE) {
           individualOnly.push(bulkEligible.pop()!);
           break;
@@ -184,7 +189,6 @@ export class DeletionService {
         const batchIds = batch.map(b => b.message_id);
 
         if (isDemo) {
-          // Demo Mode bulk deletion simulation
           await new Promise(r => setTimeout(r, Math.max(50, pacingMs)));
           for (const b of batch) {
             deleteMockMessage(job.guild_id, b.message_id);
@@ -193,7 +197,6 @@ export class DeletionService {
           }
           emitProgress(channelName, batchIds[0]);
         } else {
-          // Real Discord Bulk Delete via DiscordApiService
           try {
             await DiscordApiService.request(
               `/channels/${channelId}/messages/bulk-delete`,
@@ -208,35 +211,42 @@ export class DeletionService {
             processedCount += batch.length;
           } catch (err: any) {
             const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
-            const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'BULK_ERROR', err.message);
 
-            for (const b of batch) {
-              failedCount++;
-              processedCount++;
-              failures.push({
-                jobId,
-                messageId: b.message_id,
-                channelId,
-                channelName,
-                authorId: b.author_id,
-                timestampUtc: b.timestamp_utc,
-                errorCode: String(discordCode || err.statusCode || 'BULK_ERROR'),
-                failureReason: errorDetail.reason,
-                suggestions: errorDetail.suggestion
-              });
+            // If Discord rejects bulk delete due to invalid age (50034) or permissions,
+            // fallback immediately to individual paced deletion so salvageable messages can still be deleted
+            if (discordCode === 50034) {
+              logger.warn(`Bulk delete rejected by Discord with 50034 on channel ${channelId}. Falling back to individual deletion.`);
+              individualOnly.push(...batch);
+            } else {
+              const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'BULK_ERROR', err.message);
+
+              for (const b of batch) {
+                failedCount++;
+                processedCount++;
+                failures.push({
+                  jobId,
+                  messageId: b.message_id,
+                  channelId,
+                  channelName,
+                  authorId: b.author_id,
+                  timestampUtc: b.timestamp_utc,
+                  errorCode: String(discordCode || err.statusCode || 'BULK_ERROR'),
+                  failureReason: errorDetail.reason,
+                  suggestions: errorDetail.suggestion
+                });
+              }
             }
           }
           emitProgress(channelName, batchIds[0]);
         }
       }
 
-      // --- 3B. Process Individual Deletions (Older messages or single leftovers) ---
+      // --- 4B. Process Individual Deletions (Older messages, single leftovers, or bulk fallbacks) ---
       for (const m of individualOnly) {
         if (this.isCancelled(jobId)) break;
 
         if (isDemo) {
           await new Promise(r => setTimeout(r, Math.max(30, Math.round(pacingMs * 0.6))));
-          // In demo mode: simulate permission error on channel 106 if tested
           if (m.channel_id === '106') {
             failedCount++;
             processedCount++;
@@ -259,7 +269,6 @@ export class DeletionService {
           }
           emitProgress(channelName, m.message_id);
         } else {
-          // Real Discord Single Delete via DiscordApiService
           try {
             await DiscordApiService.request(
               `/channels/${channelId}/messages/${m.message_id}`,
@@ -271,25 +280,46 @@ export class DeletionService {
             processedCount++;
           } catch (err: any) {
             const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
-            const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'SINGLE_ERROR', err.message);
 
-            failedCount++;
-            processedCount++;
-            failures.push({
-              jobId,
-              messageId: m.message_id,
-              channelId,
-              channelName,
-              authorId: m.author_id,
-              timestampUtc: m.timestamp_utc,
-              errorCode: String(discordCode || err.statusCode || 'SINGLE_ERROR'),
-              failureReason: errorDetail.reason,
-              suggestions: errorDetail.suggestion
-            });
+            // If message was already deleted (10008), classify specifically
+            if (discordCode === 10008) {
+              failedCount++;
+              processedCount++;
+              const errorDetail = getDiscordErrorDetail(10008);
+              failures.push({
+                jobId,
+                messageId: m.message_id,
+                channelId,
+                channelName,
+                authorId: m.author_id,
+                timestampUtc: m.timestamp_utc,
+                errorCode: '10008',
+                failureReason: errorDetail.reason,
+                suggestions: errorDetail.suggestion
+              });
+            } else {
+              const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'SINGLE_ERROR', err.message);
+
+              failedCount++;
+              processedCount++;
+              failures.push({
+                jobId,
+                messageId: m.message_id,
+                channelId,
+                channelName,
+                authorId: m.author_id,
+                timestampUtc: m.timestamp_utc,
+                errorCode: String(discordCode || err.statusCode || 'SINGLE_ERROR'),
+                failureReason: errorDetail.reason,
+                suggestions: errorDetail.suggestion
+              });
+            }
           }
 
-          // Respect configured pacing interval between single message deletions
-          await new Promise(r => setTimeout(r, pacingMs));
+          // Respect pacing interval between single message deletions
+          if (pacingMs > 0 && !this.isCancelled(jobId)) {
+            await new Promise(r => setTimeout(r, pacingMs));
+          }
           emitProgress(channelName, m.message_id);
         }
       }
@@ -299,7 +329,7 @@ export class DeletionService {
     const isJobCancelled = this.isCancelled(jobId);
     this.clearCancellation(jobId);
 
-    // 4. Determine final job status
+    // 5. Determine final job status
     let finalStatus: JobStatus = 'COMPLETED';
     if (isJobCancelled) {
       finalStatus = 'CANCELLED';
@@ -309,7 +339,7 @@ export class DeletionService {
       finalStatus = 'FAILED';
     }
 
-    // 5. Persist failures & final job status in SQLite transaction
+    // 6. Persist failures & final job status in SQLite transaction
     const insertFailStmt = db.prepare(`
       INSERT INTO job_failures (job_id, message_id, channel_id, channel_name, author_id, timestamp_utc, error_code, failure_reason, suggestions)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

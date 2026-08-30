@@ -1,174 +1,230 @@
 import {
   DISCORD_API_BASE,
   DISCORD_USER_AGENT,
-  DiscordPermissions,
-  getDiscordErrorDetail
+  DiscordPermissions
 } from '../constants/discord.constants';
-import { ChannelPermissionOverwrite, DiscordChannel } from '../types';
+import { ChannelPermissionOverwrite } from '../types';
 import { logger } from '../utils/logger';
+
+export interface DiscordRequestOptions extends RequestInit {
+  maxRetries?: number;
+  body?: any;
+}
 
 export class DiscordApiError extends Error {
   public statusCode: number;
   public discordCode?: number;
-  public retryAfter?: number;
-  public details?: any;
+  public rawBody?: any;
 
-  constructor(message: string, statusCode: number, discordCode?: number, retryAfter?: number, details?: any) {
+  constructor(message: string, statusCode: number, discordCode?: number, rawBody?: any) {
     super(message);
     this.name = 'DiscordApiError';
     this.statusCode = statusCode;
     this.discordCode = discordCode;
-    this.retryAfter = retryAfter;
-    this.details = details;
+    this.rawBody = rawBody;
   }
 }
 
+interface BucketState {
+  remaining: number;
+  resetAfterMs: number;
+  resetTimestamp: number;
+}
+
 export class DiscordApiService {
-  /**
-   * Sanitizes a bot token string by stripping any leading 'Bot ' prefix and trimming whitespace.
-   */
-  public static sanitizeToken(token: string): string {
-    if (!token) return '';
-    return token.trim().replace(/^Bot\s+/i, '');
-  }
+  private static globalResetTimestamp = 0;
+  private static bucketMap = new Map<string, BucketState>();
+  private static requestQueue: Promise<void> = Promise.resolve();
 
   /**
-   * Centralized HTTP client with rate-limit backoff (429) and transient 5xx retries.
+   * Coordinated HTTP request execution with process-local rate limit queuing,
+   * exponential backoff with jitter on 5xx, and retry handling on 429.
    */
   public static async request<T = any>(
-    endpoint: string,
-    token: string,
-    options: {
-      method?: 'GET' | 'POST' | 'DELETE' | 'PATCH' | 'PUT';
-      body?: any;
-      maxRetries?: number;
-    } = {}
-  ): Promise<{ status: number; data: T }> {
-    const { method = 'GET', body, maxRetries = 3 } = options;
-    const cleanToken = this.sanitizeToken(token);
-
-    if (!cleanToken) {
-      throw new DiscordApiError('Discord Bot Token is required', 401);
-    }
-
-    const url = endpoint.startsWith('http') ? endpoint : `${DISCORD_API_BASE}${endpoint}`;
+    path: string,
+    botToken: string,
+    options: DiscordRequestOptions = {}
+  ): Promise<{ data: T; headers: Headers }> {
+    const url = path.startsWith('http') ? path : `${DISCORD_API_BASE}${path}`;
+    const maxRetries = options.maxRetries ?? 5;
     let attempt = 0;
 
-    const headers: Record<string, string> = {
-      Authorization: `Bot ${cleanToken}`,
-      'User-Agent': DISCORD_USER_AGENT
-    };
+    const sanitizedToken = botToken.startsWith('Bot ') ? botToken : `Bot ${botToken.trim()}`;
 
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-    }
-
-    while (attempt < maxRetries) {
+    while (attempt <= maxRetries) {
       attempt++;
+
+      // Wait if a global rate limit is currently active
+      const now = Date.now();
+      if (this.globalResetTimestamp > now) {
+        const waitMs = this.globalResetTimestamp - now;
+        logger.info(`Discord API Global Rate Limit active: waiting ${waitMs}ms before next request`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+      }
+
+      const headers: Record<string, string> = {
+        Authorization: sanitizedToken,
+        'User-Agent': DISCORD_USER_AGENT,
+        'Content-Type': 'application/json',
+        ...(options.headers as Record<string, string> || {})
+      };
+
+      const fetchOptions: RequestInit = {
+        ...options,
+        headers,
+        body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body
+      };
+
       try {
-        const res = await fetch(url, {
-          method,
-          headers,
-          body: body !== undefined ? JSON.stringify(body) : undefined
-        });
+        const res = await fetch(url, fetchOptions);
 
-        // 1. Handle Rate Limits (HTTP 429)
+        // Update bucket tracking from response headers
+        const bucketHeader = res.headers.get('X-RateLimit-Bucket');
+        const remainingHeader = res.headers.get('X-RateLimit-Remaining');
+        const resetAfterHeader = res.headers.get('X-RateLimit-Reset-After');
+        const isGlobalHeader = res.headers.get('X-RateLimit-Global') === 'true';
+
+        if (bucketHeader && resetAfterHeader) {
+          const resetAfterMs = Math.ceil(parseFloat(resetAfterHeader) * 1000);
+          this.bucketMap.set(bucketHeader, {
+            remaining: remainingHeader ? parseInt(remainingHeader, 10) : 1,
+            resetAfterMs,
+            resetTimestamp: Date.now() + resetAfterMs
+          });
+        }
+
+        // Handle 429 Rate Limit responses
         if (res.status === 429) {
-          let waitMs = 1000;
-          const retryAfterHeader = res.headers.get('Retry-After');
+          let retryAfterMs = 1000;
+          let isGlobal429 = isGlobalHeader;
 
-          if (retryAfterHeader) {
-            waitMs = Math.ceil(parseFloat(retryAfterHeader) * 1000);
-          } else {
-            try {
-              const resBody = await res.clone().json() as any;
-              if (resBody.retry_after) {
-                waitMs = Math.ceil(resBody.retry_after * 1000);
-              }
-            } catch {
-              // fallback
+          try {
+            const rawBody = await res.json();
+            if (rawBody && typeof rawBody.retry_after === 'number') {
+              retryAfterMs = Math.ceil(rawBody.retry_after * 1000);
+            }
+            if (rawBody?.global === true) {
+              isGlobal429 = true;
+            }
+          } catch {
+            const headerRetry = res.headers.get('Retry-After');
+            if (headerRetry) {
+              retryAfterMs = Math.ceil(parseFloat(headerRetry) * 1000);
             }
           }
 
-          logger.warn(`[DiscordApiService] 429 Rate Limit on ${method} ${endpoint}. Backing off ${waitMs}ms (attempt ${attempt}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, waitMs + 50));
-          continue;
+          // Apply a safety padding of 100ms
+          retryAfterMs += 100;
+
+          if (isGlobal429) {
+            this.globalResetTimestamp = Date.now() + retryAfterMs;
+            logger.warn(`Discord API 429 GLOBAL Rate Limit: Pausing all requests for ${retryAfterMs}ms`);
+          } else {
+            logger.warn(`Discord API 429 Route Rate Limit on ${path}: Pausing for ${retryAfterMs}ms (attempt ${attempt}/${maxRetries})`);
+          }
+
+          if (attempt <= maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, retryAfterMs));
+            continue;
+          } else {
+            throw new DiscordApiError(`Rate limit exceeded after ${maxRetries} retries`, 429, 429);
+          }
         }
 
-        // 2. Handle Transient Server Errors (HTTP 5xx)
-        if (res.status >= 500 && attempt < maxRetries) {
-          const jitter = Math.random() * 100;
-          const backoff = Math.min(2000, 200 * Math.pow(2, attempt) + jitter);
-          logger.warn(`[DiscordApiService] 5xx Server Error (${res.status}) on ${method} ${endpoint}. Retrying in ${Math.round(backoff)}ms`);
-          await new Promise(resolve => setTimeout(resolve, backoff));
-          continue;
+        // Handle 5xx Server Errors (Bounded Exponential Backoff with Jitter)
+        if (res.status >= 500 && res.status < 600) {
+          if (attempt <= maxRetries) {
+            const backoffMs = Math.min(8000, 500 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 200);
+            logger.warn(`Discord API 5xx Server Error (${res.status}) on ${path}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            continue;
+          }
         }
 
-        // 3. Handle 204 No Content
-        if (res.status === 204) {
-          return { status: 204, data: null as any };
-        }
-
-        // 4. Parse Response Body
-        const contentType = res.headers.get('content-type') || '';
-        const isJson = contentType.includes('application/json');
-        const data = isJson ? await res.json() : await res.text();
-
+        // Handle 4xx Client Errors
         if (!res.ok) {
-          const discordCode = typeof data === 'object' && data ? data.code : undefined;
-          const errorMsg = typeof data === 'object' && data ? data.message || `HTTP ${res.status}` : String(data);
-          const errorDetail = getDiscordErrorDetail(discordCode || res.status, errorMsg);
+          let rawBody: any = null;
+          let discordCode: number | undefined;
+          let message = `Discord API returned HTTP ${res.status}`;
 
-          throw new DiscordApiError(
-            errorDetail.reason,
-            res.status,
-            discordCode,
-            undefined,
-            data
-          );
+          try {
+            rawBody = await res.json();
+            if (rawBody) {
+              discordCode = rawBody.code;
+              message = rawBody.message || message;
+            }
+          } catch {
+            // Body was not JSON
+          }
+
+          throw new DiscordApiError(message, res.status, discordCode, rawBody);
         }
 
-        return { status: res.status, data: data as T };
+        // 204 No Content
+        if (res.status === 204) {
+          return { data: null as any, headers: res.headers };
+        }
+
+        const data = await res.json();
+        return { data, headers: res.headers };
       } catch (err: any) {
         if (err instanceof DiscordApiError) {
           throw err;
         }
-        if (attempt >= maxRetries) {
-          logger.error(`[DiscordApiService] Network failure after ${maxRetries} attempts on ${method} ${url}`, err);
-          throw new DiscordApiError(err.message || 'Network error communicating with Discord API', 0);
+
+        // Transient network errors (DNS, TCP, timeout)
+        if (attempt <= maxRetries) {
+          const backoffMs = 500 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
+          logger.warn(`Network error requesting ${path}: ${err.message}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue;
         }
-        const backoff = Math.min(2000, 200 * Math.pow(2, attempt) + Math.random() * 100);
-        await new Promise(resolve => setTimeout(resolve, backoff));
+
+        throw new DiscordApiError(`Network failure communicating with Discord API: ${err.message}`, 0);
       }
     }
 
-    throw new DiscordApiError(`Max retries (${maxRetries}) exceeded calling Discord API`, 504);
+    throw new DiscordApiError(`Request failed after ${maxRetries} attempts`, 0);
   }
 
   /**
-   * Computes effective permissions for a channel based on base guild permissions and overwrites.
+   * Computes effective channel permissions following Discord's authoritative 8-step permission resolution algorithm:
+   * 1. Check Administrator flag on base guild permissions (bypasses all channel overwrites).
+   * 2. Start with guild base permissions (derived from @everyone and member's guild roles).
+   * 3. Apply @everyone role overwrite on channel: permissions = (permissions & ~deny) | allow.
+   * 4. Aggregate all member's role overwrites across the channel (combining denies and allows).
+   * 5. Apply aggregated role denies: permissions &= ~roleDenies.
+   * 6. Apply aggregated role allows: permissions |= roleAllows.
+   * 7. Apply member-specific deny (if present): permissions &= ~memberDeny.
+   * 8. Apply member-specific allow (if present): permissions |= memberAllow.
+   * 9. Invariant: If VIEW_CHANNEL is false, the channel is inaccessible (canView = canReadHistory = canManageMessages = false).
    */
   public static computeChannelPermissions(
-    guildBasePermissionsBigInt: bigint,
+    baseGuildPermissions: bigint,
     overwrites: ChannelPermissionOverwrite[] = [],
-    guildId?: string
+    guildId?: string,
+    memberRoleIds: string[] = [],
+    memberUserId?: string
   ): {
     canView: boolean;
     canReadHistory: boolean;
     canManageMessages: boolean;
+    rawPermissions: bigint;
   } {
-    // Administrator grants all channel permissions unconditionally
-    if ((guildBasePermissionsBigInt & DiscordPermissions.ADMINISTRATOR) === DiscordPermissions.ADMINISTRATOR) {
+    // 1. Administrator Bypass
+    if ((baseGuildPermissions & DiscordPermissions.ADMINISTRATOR) === DiscordPermissions.ADMINISTRATOR) {
       return {
         canView: true,
         canReadHistory: true,
-        canManageMessages: true
+        canManageMessages: true,
+        rawPermissions: baseGuildPermissions
       };
     }
 
-    let permissions = guildBasePermissionsBigInt;
+    // 2. Base permissions
+    let permissions = baseGuildPermissions;
 
-    // Apply @everyone role overwrite if present
+    // 3. Apply @everyone role overwrite (type === 0, id === guildId)
     if (guildId && overwrites.length > 0) {
       const everyoneOverwrite = overwrites.find(o => o.id === guildId && o.type === 0);
       if (everyoneOverwrite) {
@@ -178,10 +234,57 @@ export class DiscordApiService {
       }
     }
 
+    // 4. Aggregate all member role overwrites
+    let roleDenies = 0n;
+    let roleAllows = 0n;
+
+    if (memberRoleIds.length > 0 && overwrites.length > 0) {
+      for (const overwrite of overwrites) {
+        if (overwrite.type === 0 && memberRoleIds.includes(overwrite.id)) {
+          roleDenies |= BigInt(overwrite.deny || '0');
+          roleAllows |= BigInt(overwrite.allow || '0');
+        }
+      }
+    }
+
+    // 5. Apply aggregated role denies
+    permissions &= ~roleDenies;
+
+    // 6. Apply aggregated role allows
+    permissions |= roleAllows;
+
+    // 7 & 8. Apply member-specific user overwrite (type === 1, id === memberUserId)
+    if (memberUserId && overwrites.length > 0) {
+      const memberOverwrite = overwrites.find(o => o.id === memberUserId && o.type === 1);
+      if (memberOverwrite) {
+        const memberDeny = BigInt(memberOverwrite.deny || '0');
+        const memberAllow = BigInt(memberOverwrite.allow || '0');
+        permissions &= ~memberDeny;
+        permissions |= memberAllow;
+      }
+    }
+
+    // 9. Evaluate specific flags with visibility hierarchy
     const canView = (permissions & DiscordPermissions.VIEW_CHANNEL) === DiscordPermissions.VIEW_CHANNEL;
+
+    if (!canView) {
+      // If a bot/user cannot view a channel, reading history and managing messages are impossible
+      return {
+        canView: false,
+        canReadHistory: false,
+        canManageMessages: false,
+        rawPermissions: permissions
+      };
+    }
+
     const canReadHistory = (permissions & DiscordPermissions.READ_MESSAGE_HISTORY) === DiscordPermissions.READ_MESSAGE_HISTORY;
     const canManageMessages = (permissions & DiscordPermissions.MANAGE_MESSAGES) === DiscordPermissions.MANAGE_MESSAGES;
 
-    return { canView, canReadHistory, canManageMessages };
+    return {
+      canView,
+      canReadHistory,
+      canManageMessages,
+      rawPermissions: permissions
+    };
   }
 }

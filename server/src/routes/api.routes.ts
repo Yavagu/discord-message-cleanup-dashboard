@@ -11,6 +11,12 @@ import { JobService } from '../services/job.service';
 import { HistoryService } from '../services/history.service';
 import { SettingsService } from '../services/settings.service';
 import { authMiddleware } from '../middleware/auth.middleware';
+import {
+  DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
+  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS,
+  DISCORD_MAX_PACING_MS,
+  DISCORD_MIN_PACING_MS
+} from '../constants/discord.constants';
 import { db } from '../db/database';
 import { FilterConfig, ScannedMessage } from '../types';
 import { logger } from '../utils/logger';
@@ -38,7 +44,7 @@ apiRouter.post('/auth/login', (req: Request, res: Response) => {
 
   const { password, username } = parseResult.data;
 
-  // Constant-time password verification without insecure fallback backdoor
+  // Constant-time SHA-256 digest verification without insecure fallback backdoor
   const isValid = AuthService.verifyPassword(password);
   if (!isValid) {
     res.status(401).json({ error: 'Invalid administrator password' });
@@ -433,7 +439,8 @@ apiRouter.get('/jobs/:jobId', (req: Request, res: Response) => {
 // ==========================================
 
 const deleteRequestSchema = z.object({
-  selectedMessageIds: z.array(z.string()).optional()
+  selectedMessageIds: z.array(z.string()).optional(),
+  confirmed: z.boolean().optional()
 });
 
 apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
@@ -445,8 +452,18 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
       return;
     }
 
-    const { selectedMessageIds } = parseResult.data;
+    const { selectedMessageIds, confirmed } = parseResult.data;
     const session = req.session!;
+    const settings = SettingsService.getSettings();
+
+    // Enforce double confirmation backend invariant if enabled
+    if (settings.requireDoubleConfirm && confirmed !== true) {
+      res.status(400).json({
+        error: 'Administrative confirmation is required to execute deletion',
+        code: 'CONFIRMATION_REQUIRED'
+      });
+      return;
+    }
 
     res.json({ success: true, message: 'Deletion job started', jobId });
 
@@ -584,8 +601,8 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
 // ==========================================
 
 const updateSettingsSchema = z.object({
-  pacingMs: z.number().min(25).max(2000).optional(),
-  bulkCutoffHours: z.number().min(24).max(336).optional(),
+  pacingMs: z.number().min(DISCORD_MIN_PACING_MS).max(DISCORD_MAX_PACING_MS).optional(),
+  bulkCutoffHours: z.number().min(DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS).max(DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS).optional(),
   requireDoubleConfirm: z.boolean().optional(),
   defaultTimezone: z.string().min(1).optional(),
   maxMessagesPerChannel: z.number().min(100).max(10000).optional()

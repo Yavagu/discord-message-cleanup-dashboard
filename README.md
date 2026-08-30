@@ -4,7 +4,7 @@
 [![Node Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-A high-performance, professional moderation and bulk message purge dashboard for Discord server administrators. Securely connect your Discord bot, configure granular multi-criteria filters (immutable Snowflake User IDs, date boundaries, and time-of-day cutoffs in any IANA timezone), preview matching messages with interactive controls, and safely execute bulk deletions with Discord API rate-limit pacing and real-time SSE progress streaming.
+A moderation and bulk message cleanup tool for Discord server administrators. Connect a Discord bot, configure multi-criteria filters (Snowflake User IDs, date boundaries, and time-of-day cutoffs in any IANA timezone), preview matching messages with interactive controls, and execute bulk deletions with Discord API rate-limit pacing and real-time SSE progress streaming.
 
 ![Discord Message Cleanup Dashboard Preview](preview.png)
 
@@ -26,7 +26,7 @@ A high-performance, professional moderation and bulk message purge dashboard for
 - [Runtime Data & SQLite Persistence Warning](#runtime-data--sqlite-persistence-warning)
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
-- [Limitations](#limitations)
+- [Known Engineering Limitations](#known-engineering-limitations)
 - [Legal & Discord Terms of Service Compliance](#legal--discord-terms-of-service-compliance)
 - [License](#license)
 
@@ -35,7 +35,7 @@ A high-performance, professional moderation and bulk message purge dashboard for
 ## Key Features
 
 1. **Ephemeral In-Memory Bot Credentials**:
-   - Bot tokens are provided via password-masked inputs and held strictly in volatile backend session memory.
+   - Bot tokens are provided via password-masked inputs and held strictly in volatile backend session memory (`Map<sessionId, token>`).
    - **Never persisted** to SQLite, `.env` files, configuration JSONs, client `localStorage`, or disk logs.
    - Server-side logging interceptors automatically redact credentials and sensitive tokens from console outputs.
 
@@ -51,8 +51,9 @@ A high-performance, professional moderation and bulk message purge dashboard for
      - **Compound Filtering**: Combined date range and time window conditions.
 
 4. **14-Day Bulk Deletion Segmentation & Safety Margins**:
-   - Messages under the configured bulk-delete threshold (default: 332 hours / ~13.83 days) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
+   - Messages under the configured bulk-delete threshold (default: 332 hours / ~13.83 days, capped at 332h max) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
    - Messages older than the threshold are automatically routed to individual message deletion endpoints with configurable rate-limit pacing.
+   - Live age is dynamically recalculated at deletion execution time to prevent race conditions where messages age past the boundary during scan review.
 
 5. **Interactive Preview & Server Revalidation**:
    - Filter, search, and paginate scanned messages before committing any destructive action.
@@ -103,16 +104,16 @@ A high-performance, professional moderation and bulk message purge dashboard for
 
 - **Frontend**:
   - React 18 with TypeScript
-  - Vite for fast bundling
-  - Tailwind CSS + Lucide Icons for modern, responsive UI
+  - Vite for bundling
+  - Tailwind CSS + Lucide Icons for UI components
   - Luxon for client-side timezone formatting and relative time calculations
 - **Backend**:
   - Node.js (v22+ / v24+) + Express
   - Node.js built-in `node:sqlite` (`DatabaseSync`) with Write-Ahead Logging (WAL) enabled
   - Server-Sent Events (SSE) for live deletion progress broadcasting
-  - Zod for strict request validation and schema enforcement
+  - Zod for request validation and schema enforcement
 - **Security & Middleware**:
-  - `HttpOnly`, `SameSite=Strict` cookie-based admin session authentication with constant-time password verification (`crypto.timingSafeEqual`)
+  - `HttpOnly`, `SameSite=Strict` cookie-based admin session authentication with constant-time password verification (`crypto.timingSafeEqual` over SHA-256 digests)
   - Cryptographically secure CSRF tokens for mutating HTTP requests
   - In-memory volatile token cache keyed by session ID with automatic expiration cleanup
 
@@ -207,7 +208,7 @@ To use the dashboard with a live Discord server:
 | `npm run dev:server` | Starts the Express server with `tsx watch`. |
 | `npm run dev:client` | Starts the Vite React development server. |
 | `npm run build` | Compiles server TypeScript and builds client production assets. |
-| `npm test` | Runs the automated backend test suite (filter rules, 14-day cutoff, auth, SQLite, permissions). |
+| `npm test` | Runs the automated backend behavioral test suite. |
 | `npm start` | Runs the compiled production server from `server/dist/index.js`. |
 
 ---
@@ -218,9 +219,9 @@ To use the dashboard with a live Discord server:
 > **NEVER COMMIT YOUR DISCORD BOT TOKEN TO GIT.**
 > Discord bot tokens grant API control over your bot and should never be pushed to GitHub, posted in issues, or added to `.env` files committed to version control.
 
-- **Volatile Token Storage**: When you connect a bot token in the UI, it is sent to the backend (over HTTPS in production reverse-proxy deployments or localhost in development) and held strictly in a `Map<sessionId, token>` in server memory. When your session ends or server restarts, all tokens are immediately wiped.
+- **Volatile Token Storage**: When you connect a bot token in the UI, it is sent to the backend and held strictly in a `Map<sessionId, token>` in server memory. When your session ends or server restarts, all tokens are immediately wiped.
 - **CSRF Token Validation**: Every state-changing API request (`POST`, `PUT`, `DELETE`, `PATCH`) requires a matching `X-CSRF-Token` header.
-- **Constant-Time Auth Verification**: Password comparison uses `crypto.timingSafeEqual` to prevent timing side-channel attacks.
+- **Constant-Time Auth Verification**: Password comparison computes SHA-256 digests and compares them via `crypto.timingSafeEqual`, preventing length leakage and timing side-channel attacks.
 - **Redacting Logger**: The server logger automatically intercepts output to sanitize and strip authentication tokens, passwords, and cookies before printing.
 
 ---
@@ -229,10 +230,11 @@ To use the dashboard with a live Discord server:
 
 The cleanup engine handles Discord's REST API constraints:
 
-1. **14-Day Bulk Delete Rule**: Discord's bulk deletion endpoint (`POST /channels/{channel.id}/messages/bulk-delete`) strictly forbids deleting messages older than 14 days (336 hours). The dashboard evaluates message age against the configured safety cutoff (default: 332 hours):
+1. **14-Day Bulk Delete Rule**: Discord's bulk deletion endpoint (`POST /channels/{channel.id}/messages/bulk-delete`) strictly forbids deleting messages older than 14 days (336 hours). The dashboard evaluates message age against the configured safety cutoff (default: 332 hours, capped at 332h max):
    - Messages $\le$ Cutoff: Grouped into bulk deletion batches of 2 to 100 messages.
    - Messages $>$ Cutoff: Dispatched individually through `DELETE /channels/{channel.id}/messages/{message.id}` with safety delay pacing.
-2. **HTTP 429 Rate Limit Handling**: Automatically parses `Retry-After` headers and JSON responses, waiting with exponential backoff and jitter.
+   - Fallback: If a bulk-delete batch request is rejected with code `50034` due to clock skew, the batch automatically falls back to individual deletion.
+2. **Rate Limit Handling**: Discord API client parses `Retry-After` headers and JSON `retry_after` fields, tracks route buckets, respects global 429 locks, and applies bounded exponential backoff with jitter on 5xx errors.
 3. **Atomic Execution Locks**: Only one deletion job can execute concurrently per session to prevent race conditions.
 
 ---
@@ -320,10 +322,14 @@ discord-message-cleanup-dashboard/
 
 ---
 
-## Limitations
+## Known Engineering Limitations
 
-- **Discord REST Rate Limits**: Deletion speeds are bound by Discord API rate limits. Bulk deletion deletes up to 100 messages every ~1–2 seconds, while individual deletions are paced to prevent 429 penalties.
-- **Direct Messages (DMs)**: Discord bots can only delete messages in Guild (Server) text channels, not private direct messages.
+1. **In-Memory Volatile Sessions**: Discord bot tokens are intentionally stored exclusively in server process RAM (`Map<sessionId, token>`) and are never written to disk or database. Consequently, restarting the backend server or container evicts all active bot connections, requiring administrators to re-enter their token.
+2. **Process-Local Rate Limiting**: The built-in rate-limiting coordinator operates in-memory within a single Node.js process. Deploying multiple backend instances behind a load balancer without a shared Redis/memory store will result in independent rate-limit queues.
+3. **Single-Instance SQLite Database**: The application uses embedded SQLite (`node:sqlite` in WAL mode). It is designed for single-node deployments; concurrent multi-process writes across different host instances are not supported.
+4. **TLS Termination Requirement**: The Express server serves unencrypted HTTP (`http://localhost:3001`). For public internet deployments, a reverse proxy (such as Nginx, Caddy, or Cloudflare) is required for TLS/HTTPS termination.
+5. **Gateway Intent Verification via REST**: Because the dashboard interacts with Discord exclusively via REST endpoints (without maintaining a persistent Gateway WebSocket connection), privileged intents (such as `GUILD_MEMBERS`) cannot be inspected directly from Discord's internal toggles and are audited dynamically when attempting member list search operations.
+6. **Non-Abortable Dispatched HTTP Requests**: When a cleanup job is cancelled via the UI, all subsequent queued deletions stop immediately. However, an HTTP request that was already dispatched and acknowledged by Discord's servers cannot be recalled or aborted.
 
 ---
 

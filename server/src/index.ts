@@ -13,10 +13,11 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Validate production security invariants
+// Enforce production security invariants
 if (process.env.NODE_ENV === 'production') {
   if (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD === 'admin123') {
-    logger.warn('⚠️ SECURITY WARNING: Running in production mode with default or empty ADMIN_PASSWORD. Set a strong secret in your environment.');
+    logger.error('CRITICAL SECURITY ERROR: Running in production mode requires a secure, non-default ADMIN_PASSWORD environment variable.');
+    process.exit(1);
   }
 }
 
