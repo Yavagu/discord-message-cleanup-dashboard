@@ -1,0 +1,70 @@
+name: Bug Report
+description: Report an issue or bug in the Discord Message Cleanup Dashboard.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 🚨 CRITICAL SECURITY WARNING
+        > **DO NOT** paste your real Discord bot token, administrative password, session secrets, or private channel logs in this issue.
+        > Always use sanitized or redacted placeholder values (e.g. `MTAx...` or `[REDACTED]`).
+
+  - type: checkboxes
+    id: security-check
+    attributes:
+      label: Security & Credential Confirmation
+      options:
+        - label: I confirm that I have NOT included any live Discord bot tokens, passwords, or credentials in this issue.
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe the problem...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Go to 'Message Cleanup'
+        2. Set filter to '...'
+        3. Click 'Scan Messages'
+        4. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Operating System / Environment
+      options:
+        - Windows
+        - macOS
+        - Linux (Ubuntu/Debian)
+        - Docker
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js Version
+      placeholder: e.g. v22.5.0 or v24.0.0
+    validations:
+      required: true

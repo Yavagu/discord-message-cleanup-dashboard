@@ -2,7 +2,7 @@
 
 [![CI Pipeline](https://github.com/Yavagu/discord-message-cleanup-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/Yavagu/discord-message-cleanup-dashboard/actions/workflows/ci.yml)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
-[![License: Private / Proprietary](https://img.shields.io/badge/license-Proprietary-blue.svg)](#)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
 A high-performance, professional moderation and bulk message purge dashboard for Discord server administrators. Securely connect your Discord bot, configure granular multi-criteria filters (immutable Snowflake User IDs, date boundaries, and time-of-day cutoffs in any IANA timezone), preview matching messages with interactive controls, and safely execute bulk deletions with Discord API rate-limit pacing and real-time SSE progress streaming.
 
@@ -27,6 +27,8 @@ A high-performance, professional moderation and bulk message purge dashboard for
 - [Project Structure](#project-structure)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
+- [Legal & Discord Terms of Service Compliance](#legal--discord-terms-of-service-compliance)
+- [License](#license)
 
 ---
 
@@ -319,6 +321,13 @@ discord-message-cleanup-dashboard/
 
 ---
 
+## Legal & Discord Terms of Service Compliance
+
+- **Trademark**: Discord is a registered trademark of Discord Inc. This project is an independent tool and is not affiliated with, endorsed by, or sponsored by Discord Inc.
+- **Compliance**: When deploying and operating a bot, server administrators are responsible for complying with the [Discord Developer Terms of Service](https://discord.com/developers/docs/policies-and-agreements/developer-terms-of-service) and [Discord Community Guidelines](https://discord.com/guidelines).
+
+---
+
 ## License
 
-This project is currently private and proprietary. All rights reserved.
+This project is licensed under the **GNU General Public License v3.0** (GPLv3). See the [LICENSE](LICENSE) file for details.
