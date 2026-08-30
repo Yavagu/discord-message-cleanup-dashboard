@@ -1,10 +1,12 @@
 # Discord Message Cleanup Dashboard
 
-[![CI Pipeline](https://github.com/your-username/discord-message-cleanup-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/discord-message-cleanup-dashboard/actions/workflows/ci.yml)
+[![CI Pipeline](https://github.com/Yavagu/discord-message-cleanup-dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/Yavagu/discord-message-cleanup-dashboard/actions/workflows/ci.yml)
 [![Node Version](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org/)
 [![License: Private / Proprietary](https://img.shields.io/badge/license-Proprietary-blue.svg)](#)
 
 A high-performance, professional moderation and bulk message purge dashboard for Discord server administrators. Securely connect your Discord bot, configure granular multi-criteria filters (immutable Snowflake User IDs, date boundaries, and time-of-day cutoffs in any IANA timezone), preview matching messages with interactive controls, and safely execute bulk deletions with Discord API rate-limit pacing and real-time SSE progress streaming.
+
+![Discord Message Cleanup Dashboard Preview](preview.png)
 
 ---
 
@@ -113,7 +115,7 @@ A high-performance, professional moderation and bulk message purge dashboard for
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-username/discord-message-cleanup-dashboard.git
+   git clone https://github.com/Yavagu/discord-message-cleanup-dashboard.git
    cd discord-message-cleanup-dashboard
    ```
 
