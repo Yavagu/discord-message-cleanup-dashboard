@@ -1,4 +1,8 @@
 import assert from 'node:assert';
+import http from 'node:http';
+import { AddressInfo } from 'node:net';
+import express from 'express';
+import cookieParser from 'cookie-parser';
 import { DateTime } from 'luxon';
 import { db, initDatabase } from '../db/database';
 import { FilterService } from '../services/filter.service';
@@ -9,11 +13,10 @@ import { DeletionService } from '../services/deletion.service';
 import { ScannerService } from '../services/scanner.service';
 import { HistoryService } from '../services/history.service';
 import { DiscordApiService, DiscordApiError } from '../services/discord-api.service';
+import { apiRouter } from '../routes/api.routes';
 import {
   DiscordPermissions,
-  DISCORD_BULK_DELETE_HARD_MAX_HOURS,
-  DISCORD_BULK_DELETE_MAX_CONFIGURABLE_HOURS,
-  DISCORD_BULK_DELETE_MIN_CONFIGURABLE_HOURS
+  DISCORD_BULK_DELETE_HARD_MAX_HOURS
 } from '../constants/discord.constants';
 import { ChannelPermissionOverwrite, FilterConfig } from '../types';
 
@@ -38,9 +41,9 @@ async function test(name: string, fn: () => void | Promise<void>) {
 }
 
 async function runAllTests() {
-  console.log('\n--- 1. Rate Limiting Coordination & Major Resource Bucket Identity ---');
+  console.log('\n--- Rate Limiting & Bucket Identity ---');
 
-  await test('Normal request returns data and headers', async () => {
+  await test('requests return payload and response headers', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -66,7 +69,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Same-route concurrency: requests are serialized in sequence', async () => {
+  await test('requests on same route execute sequentially', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     const executionOrder: number[] = [];
@@ -103,7 +106,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Two routes with SAME learned bucket hash AND SAME channel ID share quota', async () => {
+  await test('requests on same channel share learned rate limit bucket quota', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     let callCount = 0;
@@ -125,18 +128,14 @@ async function runAllTests() {
     }) as any;
 
     try {
-      // 1. Route A learns bucket-xyz for channel 1003
       await DiscordApiService.request('/channels/1003/messages', 'token');
-
-      // 2. Route B learns bucket-xyz for channel 1003 and exhausts it
       await DiscordApiService.request('/channels/1003/messages/bulk-delete', 'token', { method: 'POST', body: { messages: ['1'] } });
 
-      // 3. Route A is called again; now mapped to the shared bucket for channel 1003, it must wait
       const start = Date.now();
       await DiscordApiService.request('/channels/1003/messages', 'token');
       const elapsed = Date.now() - start;
 
-      assert.ok(elapsed >= 70, `Route A should wait on shared bucket quota exhausted by Route B (waited ${elapsed}ms)`);
+      assert.ok(elapsed >= 70, `Route should wait on shared bucket quota exhausted by other route (waited ${elapsed}ms)`);
       assert.strictEqual(callCount, 3);
     } finally {
       global.fetch = originalFetch;
@@ -144,7 +143,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Two routes with SAME learned bucket hash but DIFFERENT channel IDs do NOT share quota', async () => {
+  await test('requests on different channels do not block each other', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     const calls: Array<{ url: string; time: number }> = [];
@@ -168,15 +167,13 @@ async function runAllTests() {
     }) as any;
 
     try {
-      // 1. Call channel 1004 (it exhausts bucket for channel 1004)
       await DiscordApiService.request('/channels/1004/messages', 'token');
 
-      // 2. Call channel 1005 (different channel ID). Should NOT be blocked by channel 1004's exhaustion!
       const start = Date.now();
       await DiscordApiService.request('/channels/1005/messages', 'token');
       const elapsed = Date.now() - start;
 
-      assert.ok(elapsed < 200, `Different channel should NOT be delayed by channel 1004 quota (took ${elapsed}ms)`);
+      assert.ok(elapsed < 200, `Different channel should not wait on channel 1004 quota (took ${elapsed}ms)`);
       assert.strictEqual(calls.length, 2);
     } finally {
       global.fetch = originalFetch;
@@ -184,7 +181,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Two routes with SAME learned bucket hash but DIFFERENT guild IDs remain independent', async () => {
+  await test('requests on different guilds execute independently', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -218,7 +215,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Independent buckets execute in parallel without mutual blocking', async () => {
+  await test('requests on independent buckets execute in parallel', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     let reqAStarted = false;
@@ -265,7 +262,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Proactively waits when bucket remaining is 0 before reset', async () => {
+  await test('exhausted bucket pauses subsequent requests until reset timestamp', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     let callCount = 0;
@@ -300,7 +297,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Ordinary 429 response: pauses for retry_after and retries successfully', async () => {
+  await test('429 response pauses for retry_after and retries successfully', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     let attempts = 0;
@@ -332,7 +329,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Global 429 locks all requests across all routes', async () => {
+  await test('global 429 locks all requests across all routes', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
     let attempts = 0;
@@ -368,7 +365,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Missing rate-limit headers are handled without throwing NaN', async () => {
+  await test('missing rate limit headers are handled gracefully', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -388,7 +385,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Malformed rate-limit headers do not corrupt rate limit state', async () => {
+  await test('malformed rate limit headers do not corrupt bucket state', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -413,7 +410,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Retry exhaustion on repeated 429 throws DiscordApiError(429)', async () => {
+  await test('exhausting 429 retries throws typed DiscordApiError', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -440,7 +437,7 @@ async function runAllTests() {
     }
   });
 
-  await test('Retry exhaustion on repeated 5xx errors throws DiscordApiError', async () => {
+  await test('exhausting 5xx retries throws typed DiscordApiError', async () => {
     DiscordApiService.resetRateLimits();
     const originalFetch = global.fetch;
 
@@ -464,9 +461,191 @@ async function runAllTests() {
     }
   });
 
-  console.log('\n--- 2. Exact 14-Day (336-Hour) Bulk Delete Boundary ---');
+  await test('new requests stay serialized behind pending requests after bucket identity is learned', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+    const executionEvents: string[] = [];
 
-  await test('Settings clamps bulkCutoffHours to hard ceiling of 336h', () => {
+    global.fetch = (async (url: string) => {
+      if (url.includes('req-a')) {
+        executionEvents.push('start:A');
+        await new Promise(r => setTimeout(r, 40));
+        executionEvents.push('end:A');
+        return new Response(JSON.stringify({ name: 'A' }), {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'X-RateLimit-Bucket': 'bucket-transition-hash',
+            'X-RateLimit-Remaining': '10',
+            'X-RateLimit-Reset-After': '1'
+          })
+        });
+      }
+
+      if (url.includes('req-b')) {
+        executionEvents.push('start:B');
+        await new Promise(r => setTimeout(r, 40));
+        executionEvents.push('end:B');
+        return new Response(JSON.stringify({ name: 'B' }), {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'X-RateLimit-Bucket': 'bucket-transition-hash',
+            'X-RateLimit-Remaining': '9',
+            'X-RateLimit-Reset-After': '1'
+          })
+        });
+      }
+
+      if (url.includes('req-c')) {
+        executionEvents.push('start:C');
+        await new Promise(r => setTimeout(r, 20));
+        executionEvents.push('end:C');
+        return new Response(JSON.stringify({ name: 'C' }), {
+          status: 200,
+          headers: new Headers({
+            'Content-Type': 'application/json',
+            'X-RateLimit-Bucket': 'bucket-transition-hash',
+            'X-RateLimit-Remaining': '8',
+            'X-RateLimit-Reset-After': '1'
+          })
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as any;
+
+    try {
+      // 1. Request A starts on unlearned route
+      const pA = DiscordApiService.request('/channels/7777/messages?req-a', 'token');
+
+      // 2. Request B queues behind A on unresolved route
+      const pB = DiscordApiService.request('/channels/7777/messages?req-b', 'token');
+
+      // 3. Wait for A to complete and teach the bucket hash
+      await pA;
+
+      // 4. Request C arrives after bucket hash is learned, while B is still executing
+      const pC = DiscordApiService.request('/channels/7777/messages?req-c', 'token');
+
+      await Promise.all([pB, pC]);
+
+      // Verify B started and completed before C started
+      const bStartIndex = executionEvents.indexOf('start:B');
+      const bEndIndex = executionEvents.indexOf('end:B');
+      const cStartIndex = executionEvents.indexOf('start:C');
+
+      assert.ok(bStartIndex !== -1 && bEndIndex !== -1 && cStartIndex !== -1);
+      assert.ok(bEndIndex < cStartIndex, `Request B must finish before Request C starts (events: ${executionEvents.join(', ')})`);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('queued requests converge onto existing canonical bucket and never dispatch concurrently', async () => {
+    DiscordApiService.resetRateLimits();
+    const originalFetch = global.fetch;
+
+    let activeRequests = 0;
+    let maxConcurrentRequests = 0;
+    const events: string[] = [];
+
+    global.fetch = (async (url: string) => {
+      activeRequests++;
+      if (activeRequests > maxConcurrentRequests) {
+        maxConcurrentRequests = activeRequests;
+      }
+
+      const cleanUrl = url.split('?')[1] || url;
+      events.push(`start:${cleanUrl}`);
+
+      let delayMs = 30;
+      if (cleanUrl === 'E1' || cleanUrl === 'E2') delayMs = 40;
+      if (cleanUrl === 'A') delayMs = 20;
+      if (cleanUrl === 'B') delayMs = 30;
+      if (cleanUrl === 'C') delayMs = 20;
+
+      await new Promise(r => setTimeout(r, delayMs));
+
+      events.push(`end:${cleanUrl}`);
+      activeRequests--;
+
+      return new Response(JSON.stringify({ ok: true, name: cleanUrl }), {
+        status: 200,
+        headers: new Headers({
+          'Content-Type': 'application/json',
+          'X-RateLimit-Bucket': 'canonical-shared-bucket',
+          'X-RateLimit-Remaining': '10',
+          'X-RateLimit-Reset-After': '1'
+        })
+      });
+    }) as any;
+
+    try {
+      // 1. Route One (/channels/8888/messages) learns canonical bucket 'canonical-shared-bucket'
+      await DiscordApiService.request('/channels/8888/messages?init', 'token');
+
+      // 2. Start request E1 on canonical bucket and queue E2 behind E1
+      const pE1 = DiscordApiService.request('/channels/8888/messages?E1', 'token');
+      const pE2 = DiscordApiService.request('/channels/8888/messages?E2', 'token');
+
+      // 3. Start request A on Route Two (/channels/8888/messages/bulk-delete) which has not yet learned canonical identity
+      const pA = DiscordApiService.request('/channels/8888/messages/bulk-delete?A', 'token', { method: 'POST', body: { messages: ['1'] } });
+
+      // 4. Queue B behind A on Route Two
+      const pB = DiscordApiService.request('/channels/8888/messages/bulk-delete?B', 'token', { method: 'POST', body: { messages: ['2'] } });
+
+      // 5. Wait for A to complete and reveal that Route Two maps to 'canonical-shared-bucket'
+      await pA;
+
+      // 6. Send request C after the mapping has been learned
+      const pC = DiscordApiService.request('/channels/8888/messages/bulk-delete?C', 'token', { method: 'POST', body: { messages: ['3'] } });
+
+      await Promise.all([pE1, pE2, pB, pC]);
+
+      // Check for concurrent execution between B and canonical bucket work (E1/E2)
+      // Under previous Promise.all, B would dispatch independently when A finished while E1 or E2 was still running.
+      const bStartIndex = events.indexOf('start:B');
+      const e2EndIndex = events.indexOf('end:E2');
+      const e1EndIndex = events.indexOf('end:E1');
+
+      // B must not start until E1 and E2 on canonical bucket have completed
+      assert.ok(bStartIndex > e1EndIndex, `B must start after E1 completes (events: ${events.join(', ')})`);
+      assert.ok(bStartIndex > e2EndIndex, `B must start after E2 completes (events: ${events.join(', ')})`);
+
+      // C must start after B completes
+      const bEndIndex = events.indexOf('end:B');
+      const cStartIndex = events.indexOf('start:C');
+      assert.ok(cStartIndex > bEndIndex, `C must start after B completes (events: ${events.join(', ')})`);
+    } finally {
+      global.fetch = originalFetch;
+      DiscordApiService.resetRateLimits();
+    }
+  });
+
+  await test('member lookup and member search use distinct route identities', () => {
+    const lookup = DiscordApiService.parseRouteInfo('GET', '/guilds/111/members/222');
+    const search = DiscordApiService.parseRouteInfo('GET', '/guilds/111/members/search?query=test');
+    const list = DiscordApiService.parseRouteInfo('GET', '/guilds/111/members');
+
+    assert.notStrictEqual(lookup.routeKey, search.routeKey, 'Lookup and search must not share a route key');
+    assert.notStrictEqual(lookup.routeKey, list.routeKey, 'Lookup and list must not share a route key');
+    assert.strictEqual(lookup.majorParam, 'guild:111');
+    assert.strictEqual(search.majorParam, 'guild:111');
+  });
+
+  await test('query parameters do not generate duplicate route identities', () => {
+    const page1 = DiscordApiService.parseRouteInfo('GET', '/channels/555/messages?limit=50');
+    const page2 = DiscordApiService.parseRouteInfo('GET', '/channels/555/messages?limit=100&before=999');
+
+    assert.strictEqual(page1.routeKey, page2.routeKey, 'Varying query params on same endpoint must share route key');
+    assert.strictEqual(page1.majorParam, 'channel:555');
+  });
+
+  console.log('\n--- Bulk Delete Boundary ---');
+
+  await test('bulk cutoff setting clamps to 336 hour ceiling', () => {
     const clampedMax = SettingsService.updateSettings({ bulkCutoffHours: 400 });
     assert.strictEqual(clampedMax.bulkCutoffHours, 336);
 
@@ -476,29 +655,33 @@ async function runAllTests() {
     SettingsService.updateSettings({ bulkCutoffHours: 336 });
   });
 
-  await test('Exact boundary evaluation: 14d - 1ms is bulk candidate, exactly 14d and 14d + 1ms are individual only', () => {
+  await test('message 14 days minus 1 ms is bulk candidate', () => {
     const cutoffDays = 14.0;
     const ref = DateTime.fromISO('2026-08-30T12:00:00.000Z', { zone: 'utc' });
-
-    // 14 days minus 1 ms (13 days, 23 hours, 59 minutes, 59 seconds, 999 ms)
     const minus1ms = ref.minus({ days: 14 }).plus({ milliseconds: 1 }).toISO()!;
-    assert.strictEqual(FilterService.isBulkDeletable(minus1ms, cutoffDays, ref), true, '14d - 1ms must be bulk candidate');
-
-    // Exactly 14 days (14.000000 days -> age >= 14d -> false)
-    const exactly14d = ref.minus({ days: 14 }).toISO()!;
-    assert.strictEqual(FilterService.isBulkDeletable(exactly14d, cutoffDays, ref), false, 'Exactly 14.00d must be individual deletion only');
-
-    // 14 days plus 1 ms (14 days + 1 ms -> age > 14d -> false)
-    const plus1ms = ref.minus({ days: 14 }).minus({ milliseconds: 1 }).toISO()!;
-    assert.strictEqual(FilterService.isBulkDeletable(plus1ms, cutoffDays, ref), false, '14d + 1ms must be individual deletion only');
+    assert.strictEqual(FilterService.isBulkDeletable(minus1ms, cutoffDays, ref), true);
   });
 
-  console.log('\n--- 3. Scanner Limits (Table-Driven Pagination Tests) ---');
+  await test('message exactly 14 days old uses individual deletion', () => {
+    const cutoffDays = 14.0;
+    const ref = DateTime.fromISO('2026-08-30T12:00:00.000Z', { zone: 'utc' });
+    const exactly14d = ref.minus({ days: 14 }).toISO()!;
+    assert.strictEqual(FilterService.isBulkDeletable(exactly14d, cutoffDays, ref), false);
+  });
+
+  await test('message 14 days plus 1 ms uses individual deletion', () => {
+    const cutoffDays = 14.0;
+    const ref = DateTime.fromISO('2026-08-30T12:00:00.000Z', { zone: 'utc' });
+    const plus1ms = ref.minus({ days: 14 }).minus({ milliseconds: 1 }).toISO()!;
+    assert.strictEqual(FilterService.isBulkDeletable(plus1ms, cutoffDays, ref), false);
+  });
+
+  console.log('\n--- Scanner Pagination Limits ---');
 
   const testLimits = [1, 99, 100, 101, 150, 199, 200, 250];
 
   for (const limit of testLimits) {
-    await test(`Scanner limit = ${limit}: requests exact page sizes and caps total processed`, async () => {
+    await test(`scanner requests exact page sizes and caps total processed (${limit})`, async () => {
       DiscordApiService.resetRateLimits();
       const originalFetch = global.fetch;
       const requestedLimits: number[] = [];
@@ -560,13 +743,12 @@ async function runAllTests() {
           'mock-token'
         );
 
-        assert.strictEqual(result.scannedCount, limit, `Expected ${limit} scanned messages, got ${result.scannedCount}`);
-
+        assert.strictEqual(result.scannedCount, limit);
         const totalRequested = requestedLimits.reduce((a, b) => a + b, 0);
-        assert.strictEqual(totalRequested, limit, `Requested limits ${requestedLimits.join('+')} sum to ${totalRequested}, expected ${limit}`);
+        assert.strictEqual(totalRequested, limit);
 
         for (const reqLimit of requestedLimits) {
-          assert.ok(reqLimit <= 100, `Page limit ${reqLimit} exceeded Discord max 100`);
+          assert.ok(reqLimit <= 100);
         }
       } finally {
         global.fetch = originalFetch;
@@ -577,9 +759,86 @@ async function runAllTests() {
 
   SettingsService.updateSettings({ maxMessagesPerChannel: 1000 });
 
-  console.log('\n--- 4. Session Ownership & Explicit Session-Scoped Report APIs ---');
+  console.log('\n--- Session Isolation & Authorization ---');
 
-  await test('Session isolation on retrieval, cancel, execution, and explicit ForSession report APIs', async () => {
+  await test('foreign session receives 404 and cannot execute deletion via HTTP route', async () => {
+    const sessionA = AuthService.createSession('adminA', false);
+    const sessionB = AuthService.createSession('adminB', false);
+
+    const filter: FilterConfig = {
+      targetUserId: '987654321000000001',
+      channelIds: ['101'],
+      timezone: 'UTC',
+      dateMode: 'ALL_TIME',
+      timeMode: 'ANY_TIME'
+    };
+
+    const jobA = JobService.createJob(
+      sessionA.id,
+      'guild-auth-test',
+      'Guild Auth',
+      '987654321000000001',
+      'Target',
+      'Target',
+      '',
+      [{ id: '101', name: 'general' }],
+      filter
+    );
+
+    JobService.updateJobStatus(jobA.id, 'READY');
+    db.prepare(`
+      INSERT INTO job_scanned_messages (job_id, message_id, channel_id, channel_name, author_id, author_username, author_display_name, author_avatar_url, content, timestamp_utc, timestamp_local_formatted, is_bulk_deletable, age_days, is_selected)
+      VALUES (?, 'msg-http-1', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'Hello', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1)
+    `).run(jobA.id);
+
+    // Set cancellation token on Job A
+    DeletionService.cancelJob(jobA.id);
+
+    // Mount Express app for integration test
+    const app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use('/api', apiRouter);
+
+    const server = http.createServer(app);
+    await new Promise<void>(resolve => server.listen(0, resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      // Session B attempts to delete Job A
+      const res = await fetch(`http://127.0.0.1:${port}/api/jobs/${jobA.id}/delete`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session-id': sessionB.id,
+          'x-csrf-token': sessionB.csrfToken
+        },
+        body: JSON.stringify({ confirmed: true })
+      });
+
+      assert.strictEqual(res.status, 404, 'Foreign session must receive 404');
+      const body = await res.json() as any;
+      assert.ok(body.error.includes('unauthorized') || body.error.includes('not found'));
+
+      // Verify Job A status remains READY in DB
+      const jobAState = JobService.getJobForSession(jobA.id, sessionA.id);
+      assert.strictEqual(jobAState?.status, 'READY', 'Job status must remain READY');
+
+      // Verify cancellation token was not cleared by foreign attempt
+      assert.strictEqual(DeletionService.isCancelled(jobA.id), true, 'Cancellation state must not be cleared');
+
+      // Verify no failure records were written
+      const failCount = db.prepare('SELECT COUNT(*) as count FROM job_failures WHERE job_id = ?').get(jobA.id) as any;
+      assert.strictEqual(failCount.count, 0, 'No failures should be recorded');
+    } finally {
+      DeletionService.clearCancellation(jobA.id);
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
+  await test('concurrent owner deletion requests: exactly one accepted (200), competitor rejected with conflict (409)', async () => {
+    const session = AuthService.createSession('adminOwner', false);
+
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -589,60 +848,141 @@ async function runAllTests() {
     };
 
     const job = JobService.createJob(
-      'session-alpha',
-      'guild-123',
-      'Guild Alpha',
+      session.id,
+      'guild-owner-race',
+      'Guild Owner Race',
       '987654321000000001',
-      'TargetUser',
-      'TargetUser',
+      'Target',
+      'Target',
       '',
       [{ id: '101', name: 'general' }],
       filter
     );
 
-    // 1. Retrieval
-    assert.ok(JobService.getJobForSession(job.id, 'session-alpha') !== null, 'Owner can retrieve job');
-    assert.strictEqual(JobService.getJobForSession(job.id, 'session-beta'), null, 'Foreign session cannot retrieve job');
-
-    // 2. Cancellation
-    assert.strictEqual(JobService.cancelJobForSession(job.id, 'session-beta'), false, 'Foreign session cannot cancel job');
-    assert.strictEqual(JobService.cancelJobForSession(job.id, 'session-alpha'), true, 'Owner can cancel job');
-
-    // 3. Execution rejection for foreign session
     JobService.updateJobStatus(job.id, 'READY');
     db.prepare(`
       INSERT INTO job_scanned_messages (job_id, message_id, channel_id, channel_name, author_id, author_username, author_display_name, author_avatar_url, content, timestamp_utc, timestamp_local_formatted, is_bulk_deletable, age_days, is_selected)
-      VALUES (?, 'msg-sess-1', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'Test', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1)
+      VALUES (?, 'msg-owner-race-1', '101', 'general', '987654321000000001', 'Target', 'Target', '', 'Hello', '2026-08-20T12:00:00Z', '2026-08-20', 1, 5, 1)
     `).run(job.id);
 
-    let foreignExecThrew = false;
+    const app = express();
+    app.use(express.json());
+    app.use(cookieParser());
+    app.use('/api', apiRouter);
+
+    const server = http.createServer(app);
+    await new Promise<void>(resolve => server.listen(0, resolve));
+    const port = (server.address() as AddressInfo).port;
+
     try {
-      await DeletionService.executeDeletion(job.id, 'session-beta', null, true);
-    } catch (err: any) {
-      foreignExecThrew = true;
-      assert.ok(err.message.includes('unauthorized') || err.message.includes('not found'));
+      // Send two concurrent POST delete requests from the same authenticated owner session
+      const [res1, res2] = await Promise.all([
+        fetch(`http://127.0.0.1:${port}/api/jobs/${job.id}/delete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-session-id': session.id,
+            'x-csrf-token': session.csrfToken
+          },
+          body: JSON.stringify({ confirmed: true })
+        }),
+        fetch(`http://127.0.0.1:${port}/api/jobs/${job.id}/delete`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-session-id': session.id,
+            'x-csrf-token': session.csrfToken
+          },
+          body: JSON.stringify({ confirmed: true })
+        })
+      ]);
+
+      const statuses = [res1.status, res2.status].sort();
+      assert.deepStrictEqual(statuses, [200, 409], 'Exactly one request must succeed (200) and the competitor must receive 409');
+
+      const body200 = res1.status === 200 ? await res1.json() : await res2.json();
+      const body409 = res1.status === 409 ? await res1.json() : await res2.json();
+
+      assert.strictEqual(body200.success, true);
+      assert.strictEqual(body409.code, 'EXECUTION_CONFLICT');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
     }
-    assert.strictEqual(foreignExecThrew, true, 'Foreign session execution rejected');
-
-    // 4. Report & Export session isolation via explicit ForSession APIs
-    const alphaReport = HistoryService.getJobReportForSession(job.id, 'session-alpha');
-    assert.ok(alphaReport !== null, 'Owner can access report via getJobReportForSession');
-
-    const betaReport = HistoryService.getJobReportForSession(job.id, 'session-beta');
-    assert.strictEqual(betaReport, null, 'Foreign session cannot access report via getJobReportForSession');
-
-    assert.throws(() => {
-      HistoryService.exportReportAsJSONForSession(job.id, 'session-beta');
-    }, /unauthorized|not found/, 'Foreign session JSON export rejected');
-
-    assert.throws(() => {
-      HistoryService.exportReportAsCSVForSession(job.id, 'session-beta');
-    }, /unauthorized|not found/, 'Foreign session CSV export rejected');
   });
 
-  console.log('\n--- 5. Atomic Deletion Concurrency Lock ---');
+  await test('foreign session cannot clear cancellation token or mutate job status', async () => {
+    const filter: FilterConfig = {
+      targetUserId: '987654321000000001',
+      channelIds: ['101'],
+      timezone: 'UTC',
+      dateMode: 'ALL_TIME',
+      timeMode: 'ANY_TIME'
+    };
 
-  await test('Simultaneous deletion executions: exactly one acquires lock, competitor rejected', async () => {
+    const job = JobService.createJob(
+      'session-owner',
+      'guild-1',
+      'Guild 1',
+      '987654321000000001',
+      'User',
+      'User',
+      '',
+      [{ id: '101', name: 'general' }],
+      filter
+    );
+
+    JobService.updateJobStatus(job.id, 'READY');
+    DeletionService.cancelJob(job.id);
+
+    let threw = false;
+    try {
+      await DeletionService.executeDeletion(job.id, 'session-foreign', null, true);
+    } catch (err: any) {
+      threw = true;
+      assert.ok(err.message.includes('unauthorized') || err.message.includes('not found'));
+    }
+
+    assert.strictEqual(threw, true);
+    assert.strictEqual(DeletionService.isCancelled(job.id), true, 'Cancellation token must remain set');
+    DeletionService.clearCancellation(job.id);
+  });
+
+  await test('foreign session cannot cancel job or access report exports', () => {
+    const filter: FilterConfig = {
+      targetUserId: '987654321000000001',
+      channelIds: ['101'],
+      timezone: 'UTC',
+      dateMode: 'ALL_TIME',
+      timeMode: 'ANY_TIME'
+    };
+
+    const job = JobService.createJob(
+      'session-user-1',
+      'guild-reports',
+      'Guild Reports',
+      '987654321000000001',
+      'Target',
+      'Target',
+      '',
+      [{ id: '101', name: 'general' }],
+      filter
+    );
+
+    assert.strictEqual(JobService.cancelJobForSession(job.id, 'session-user-2'), false);
+    assert.strictEqual(HistoryService.getJobReportForSession(job.id, 'session-user-2'), null);
+
+    assert.throws(() => {
+      HistoryService.exportReportAsJSONForSession(job.id, 'session-user-2');
+    }, /unauthorized|not found/);
+
+    assert.throws(() => {
+      HistoryService.exportReportAsCSVForSession(job.id, 'session-user-2');
+    }, /unauthorized|not found/);
+  });
+
+  console.log('\n--- Atomic Deletion Concurrency ---');
+
+  await test('simultaneous deletion executions: exactly one acquires lock, competitor rejected', async () => {
     const filter: FilterConfig = {
       targetUserId: '987654321000000001',
       channelIds: ['101'],
@@ -690,9 +1030,9 @@ async function runAllTests() {
     assert.strictEqual(finalState?.deletedCount, 2);
   });
 
-  console.log('\n--- 6. Authentication & Constant-Time Verification ---');
+  console.log('\n--- Authentication ---');
 
-  await test('Verifies password via constant-time 32-byte SHA-256 digests across all input types', () => {
+  await test('constant-time password verification handles all input types safely', () => {
     process.env.ADMIN_PASSWORD = 'ProductionSafeAdminPass2026!';
 
     assert.strictEqual(AuthService.verifyPassword('ProductionSafeAdminPass2026!'), true);
@@ -708,9 +1048,9 @@ async function runAllTests() {
     process.env.ADMIN_PASSWORD = 'admin123';
   });
 
-  console.log('\n--- 7. Discord Channel Permission Resolution Semantics ---');
+  console.log('\n--- Discord Channel Permissions ---');
 
-  await test('Administrator role bypasses all channel-level denies', () => {
+  await test('administrator permission bypasses channel-level denies', () => {
     const adminPerms = DiscordPermissions.ADMINISTRATOR;
     const overwrites: ChannelPermissionOverwrite[] = [{
       id: 'guild123',
@@ -725,7 +1065,7 @@ async function runAllTests() {
     assert.strictEqual(result.canManageMessages, true);
   });
 
-  await test('Channel @everyone deny removes permission when not granted elsewhere', () => {
+  await test('everyone role deny removes permission when not granted elsewhere', () => {
     const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.MANAGE_MESSAGES;
     const overwrites: ChannelPermissionOverwrite[] = [{
       id: 'guild123',
@@ -739,7 +1079,7 @@ async function runAllTests() {
     assert.strictEqual(result.canManageMessages, false);
   });
 
-  await test('Role allow overrides conflicting role deny across member roles', () => {
+  await test('role allow overrides conflicting role deny across member roles', () => {
     const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
     const overwrites: ChannelPermissionOverwrite[] = [
       { id: 'roleDeny', type: 0, allow: '0', deny: String(DiscordPermissions.MANAGE_MESSAGES) },
@@ -756,7 +1096,7 @@ async function runAllTests() {
     assert.strictEqual(result.canManageMessages, true);
   });
 
-  await test('Member-specific user overwrite takes precedence over role allow', () => {
+  await test('member specific overwrite takes precedence over role overwrite', () => {
     const basePerms = DiscordPermissions.VIEW_CHANNEL | DiscordPermissions.READ_MESSAGE_HISTORY;
     const overwrites: ChannelPermissionOverwrite[] = [
       { id: 'roleAllow', type: 0, allow: String(DiscordPermissions.MANAGE_MESSAGES), deny: '0' },
@@ -773,7 +1113,7 @@ async function runAllTests() {
     assert.strictEqual(result.canManageMessages, false);
   });
 
-  await test('Lack of VIEW_CHANNEL denies dependent read history and manage messages capabilities', () => {
+  await test('denying VIEW_CHANNEL denies dependent message permissions', () => {
     const basePerms = DiscordPermissions.MANAGE_MESSAGES | DiscordPermissions.READ_MESSAGE_HISTORY;
     const overwrites: ChannelPermissionOverwrite[] = [{
       id: 'guild123',

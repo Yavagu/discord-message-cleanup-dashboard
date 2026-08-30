@@ -51,8 +51,8 @@ A moderation and bulk message cleanup tool for Discord server administrators. Co
      - **Compound Filtering**: Combined date range and time window conditions.
 
 4. **14-Day Bulk Deletion Segmentation & Live Age Recalculation**:
-   - Messages under the configured bulk-delete threshold (default: 336 hours / 14 days, configurable up to 336h max) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
-   - Messages older than the threshold are automatically routed to individual message deletion endpoints with configurable rate-limit pacing.
+   - Messages strictly younger than the configured bulk-delete threshold (default: 336 hours / 14 days, configurable up to 336h max) are grouped into Discord bulk delete batches (2–100 messages per request) for rapid cleanup.
+   - Messages exactly 14 days old or older are automatically routed to individual message deletion endpoints with configurable rate-limit pacing.
    - Live age is dynamically recalculated at deletion execution time to prevent race conditions where messages age past the boundary during scan review.
    - Automatic Fallback: If Discord rejects a batch with `50034` due to clock drift, it automatically falls back to paced individual deletion.
 
@@ -232,11 +232,11 @@ To use the dashboard with a live Discord server:
 The cleanup engine handles Discord's REST API constraints:
 
 1. **14-Day Bulk Delete Rule**: Discord's bulk deletion endpoint (`POST /channels/{channel.id}/messages/bulk-delete`) strictly forbids deleting messages older than 14 days (336 hours). The dashboard evaluates message age against the configured threshold (default: 336 hours / 14 days, capped at 336h max):
-   - Messages $\le$ Cutoff: Grouped into bulk deletion batches of 2 to 100 messages.
-   - Messages $>$ Cutoff: Dispatched individually through `DELETE /channels/{channel.id}/messages/{message.id}` with safety delay pacing.
-   - Fallback: If a bulk-delete batch request is rejected with code `50034` due to clock skew, the batch automatically falls back to individual deletion.
-2. **Rate Limit Handling**: Discord API client parses `Retry-After` headers and JSON `retry_after` fields, tracks route buckets, respects global 429 locks, and applies bounded exponential backoff with jitter on 5xx errors.
-3. **Atomic Execution Locks**: Only one deletion job can execute concurrently per session to prevent race conditions.
+   - Messages strictly younger than 14 days may be bulk deleted in batches of 2 to 100 messages.
+   - Messages exactly 14 days old or older use paced individual deletion (`DELETE /channels/{channel.id}/messages/{message.id}`).
+   - Automatic Fallback: If a bulk-delete batch request is rejected with code `50034` due to clock skew, the batch automatically falls back to individual deletion.
+2. **Rate Limit Handling**: Discord API client parses `Retry-After` headers and JSON `retry_after` fields, tracks route buckets scoped to (bucket hash, major resource parameter), respects global 429 locks, and applies bounded exponential backoff with jitter on 5xx errors.
+3. **Atomic Execution Locks**: Atomic job-state transitions prevent the same cleanup job from being executed concurrently.
 
 ---
 

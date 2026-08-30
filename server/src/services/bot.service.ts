@@ -18,7 +18,13 @@ export class BotService {
     }
 
     try {
-      const { data: user } = await DiscordApiService.request('/users/@me', token);
+      const { data: user } = await DiscordApiService.request<{
+        id: string;
+        username: string;
+        discriminator?: string;
+        avatar?: string | null;
+        flags?: number;
+      }>('/users/@me', token);
 
       const avatarUrl = user.avatar
         ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`

@@ -105,7 +105,7 @@ export interface ScannedMessage {
   attachmentCount: number;
   hasEmbeds: boolean;
   embedCount: number;
-  isBulkDeletable: boolean; // evaluated against configured safety cutoff
+  isBulkDeletable: boolean;
   ageDays: number;
 }
 
@@ -132,7 +132,7 @@ export interface CleanupJob {
   targetUsername: string;
   targetDisplayName: string;
   targetAvatarUrl: string;
-  channelsJson: string; // JSON array of channel IDs and names
+  channelsJson: string;
   filterConfig: FilterConfig;
   timezone: string;
   scannedCount: number;
@@ -189,7 +189,7 @@ export interface AdminSession {
   adminUser: string;
   csrfToken: string;
   isDemo: boolean;
-  botToken?: string; // in-memory session only
+  botToken?: string;
   createdAt: string;
   expiresAt: string;
 }
@@ -225,4 +225,64 @@ export interface DetailedCleanupReport {
   }>;
   failures: CleanupFailure[];
   scannedSample: ScannedMessage[];
+}
+
+export interface DiscordRateLimitResponse {
+  message?: string;
+  retry_after?: number;
+  global?: boolean;
+  code?: number;
+}
+
+export interface DiscordErrorResponse {
+  code?: number;
+  message?: string;
+  errors?: Record<string, unknown>;
+}
+
+export interface ScannedMessageRow {
+  id?: number;
+  job_id: string;
+  message_id: string;
+  channel_id: string;
+  channel_name: string;
+  author_id: string;
+  author_username: string;
+  author_display_name: string;
+  author_avatar_url: string;
+  content: string;
+  timestamp_utc: string;
+  timestamp_local_formatted: string;
+  has_attachments: number;
+  attachment_count: number;
+  has_embeds: number;
+  embed_count: number;
+  is_bulk_deletable: number;
+  age_days: number;
+  is_selected: number;
+}
+
+export interface CleanupJobRow {
+  id: string;
+  session_id: string;
+  status: JobStatus;
+  guild_id: string;
+  guild_name: string;
+  target_user_id: string;
+  target_username: string;
+  target_display_name: string;
+  target_avatar_url: string;
+  channels_json: string;
+  filter_config_json: string;
+  timezone: string;
+  scanned_count: number;
+  matched_count: number;
+  selected_count: number;
+  deleted_count: number;
+  failed_count: number;
+  duration_ms: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at: string;
+  error?: string | null;
 }

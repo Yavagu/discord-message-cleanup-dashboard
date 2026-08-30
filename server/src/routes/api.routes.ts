@@ -439,8 +439,8 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
 
     const { selectedMessageIds, confirmed } = parseResult.data;
     const session = req.session!;
-    const settings = SettingsService.getSettings();
 
+    const settings = SettingsService.getSettings();
     if (settings.requireDoubleConfirm && confirmed !== true) {
       res.status(400).json({
         error: 'Administrative confirmation is required to execute deletion',
@@ -449,8 +449,24 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
       return;
     }
 
+    // Atomically authorize and reserve job execution (transitions READY -> DELETING)
+    const reservation = DeletionService.reserveExecution(jobId, session.id, selectedMessageIds || null);
+    if (!reservation.success) {
+      if (reservation.code === 'NOT_FOUND') {
+        res.status(404).json({ error: reservation.error });
+        return;
+      }
+      if (reservation.code === 'CONFLICT') {
+        res.status(409).json({ error: reservation.error, code: 'EXECUTION_CONFLICT' });
+        return;
+      }
+      res.status(400).json({ error: reservation.error, code: reservation.code });
+      return;
+    }
+
     res.json({ success: true, message: 'Deletion job started', jobId });
 
+    // Run deletion asynchronously using the pre-reserved execution lock and target rows
     DeletionService.executeDeletion(
       jobId,
       session.id,
@@ -459,14 +475,14 @@ apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
       session.botToken,
       (update) => {
         JobService.broadcastProgress(update);
-      }
+      },
+      reservation.targetRows
     ).catch(err => {
       logger.error(`Async deletion failed for job ${jobId}`, err);
-      JobService.updateJobStatus(jobId, 'FAILED', err.message);
     });
   } catch (err: any) {
     logger.error(`Error initiating deletion for job ${req.params.jobId}`, err);
-    res.status(400).json({ error: err.message });
+    res.status(500).json({ error: err.message || 'Failed to initiate deletion' });
   }
 });
 

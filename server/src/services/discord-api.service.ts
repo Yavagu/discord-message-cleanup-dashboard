@@ -3,20 +3,24 @@ import {
   DISCORD_USER_AGENT,
   DiscordPermissions
 } from '../constants/discord.constants';
-import { ChannelPermissionOverwrite } from '../types';
+import {
+  ChannelPermissionOverwrite,
+  DiscordErrorResponse,
+  DiscordRateLimitResponse
+} from '../types';
 import { logger } from '../utils/logger';
 
-export interface DiscordRequestOptions extends RequestInit {
+export interface DiscordRequestOptions extends Omit<RequestInit, 'body'> {
   maxRetries?: number;
-  body?: any;
+  body?: unknown;
 }
 
 export class DiscordApiError extends Error {
   public statusCode: number;
   public discordCode?: number;
-  public rawBody?: any;
+  public rawBody?: unknown;
 
-  constructor(message: string, statusCode: number, discordCode?: number, rawBody?: any) {
+  constructor(message: string, statusCode: number, discordCode?: number, rawBody?: unknown) {
     super(message);
     this.name = 'DiscordApiError';
     this.statusCode = statusCode;
@@ -25,47 +29,121 @@ export class DiscordApiError extends Error {
   }
 }
 
-interface BucketState {
-  remaining: number;
-  resetTimestamp: number;
-  queue: Promise<void>;
+class RateLimitBucket {
+  public readonly key: string;
+  public remaining = 1;
+  public resetTimestamp = 0;
+  private queue: Array<() => Promise<void>> = [];
+  private isProcessing = false;
+
+  constructor(key: string) {
+    this.key = key;
+  }
+
+  /**
+   * Enqueues a dispatch task onto this bucket's FIFO execution queue.
+   */
+  public enqueue<T>(task: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await task();
+          resolve(result);
+        } catch (err) {
+          reject(err);
+        }
+      });
+      this.processNext();
+    });
+  }
+
+  /**
+   * Migrates queued tasks from an unresolved temporary bucket into this canonical bucket.
+   */
+  public mergeFrom(other: RateLimitBucket): void {
+    if (other.queue.length > 0) {
+      this.queue.push(...other.queue);
+      other.queue = [];
+    }
+    this.processNext();
+  }
+
+  private processNext(): void {
+    if (this.isProcessing || this.queue.length === 0) return;
+    this.isProcessing = true;
+
+    const nextTask = this.queue.shift()!;
+    (async () => {
+      try {
+        await nextTask();
+      } finally {
+        this.isProcessing = false;
+        this.processNext();
+      }
+    })();
+  }
 }
 
 export class DiscordApiService {
   private static globalResetTimestamp = 0;
-  private static buckets = new Map<string, BucketState>();
+  private static buckets = new Map<string, RateLimitBucket>();
   private static routeToBucketIdentity = new Map<string, string>();
 
+  private static getOrCreateBucket(key: string): RateLimitBucket {
+    let bucket = this.buckets.get(key);
+    if (!bucket) {
+      bucket = new RateLimitBucket(key);
+      this.buckets.set(key, bucket);
+    }
+    return bucket;
+  }
+
   /**
-   * Extracts the Discord major resource parameter (channel_id, guild_id) and route pattern.
-   * In Discord's rate-limit architecture, rate-limit buckets are scoped to (bucket_hash, major_parameter).
+   * Extracts the Discord major resource parameter (channel_id, guild_id) and normalized route pattern.
+   * Discord rate limits are scoped to (bucket_hash, major_parameter).
    */
-  private static parseRouteInfo(method: string, path: string): { routeKey: string; majorParam: string } {
+  public static parseRouteInfo(method: string, path: string): { routeKey: string; majorParam: string } {
     const cleanPath = path.split('?')[0];
 
-    const channelMatch = cleanPath.match(/\/channels\/(\d+)/);
+    // Channel routes: /channels/:id, /channels/:id/messages, /channels/:id/messages/bulk-delete, etc.
+    const channelMatch = cleanPath.match(/^\/channels\/(\d+)(.*)$/);
     if (channelMatch) {
       const channelId = channelMatch[1];
+      const subPath = channelMatch[2];
       const majorParam = `channel:${channelId}`;
-      const routePattern = cleanPath.endsWith('/bulk-delete')
-        ? `${method}:/channels/:id/messages/bulk-delete`
-        : `${method}:/channels/:id/messages`;
-      return { routeKey: `${routePattern}:${majorParam}`, majorParam };
-    }
 
-    const guildMatch = cleanPath.match(/\/guilds\/(\d+)/);
-    if (guildMatch) {
-      const guildId = guildMatch[1];
-      const majorParam = `guild:${guildId}`;
-      let routePattern = `${method}:/guilds/:id`;
-      if (cleanPath.includes('/members')) {
-        routePattern = `${method}:/guilds/:id/members`;
-      } else if (cleanPath.includes('/channels')) {
-        routePattern = `${method}:/guilds/:id/channels`;
+      let routePattern = `${method}:/channels/:id`;
+      if (subPath.startsWith('/messages/bulk-delete')) {
+        routePattern = `${method}:/channels/:id/messages/bulk-delete`;
+      } else if (subPath.match(/^\/messages\/\d+$/)) {
+        routePattern = `${method}:/channels/:id/messages/:id`;
+      } else if (subPath.startsWith('/messages')) {
+        routePattern = `${method}:/channels/:id/messages`;
       }
       return { routeKey: `${routePattern}:${majorParam}`, majorParam };
     }
 
+    // Guild routes: /guilds/:id, /guilds/:id/channels, /guilds/:id/members, /guilds/:id/members/search, etc.
+    const guildMatch = cleanPath.match(/^\/guilds\/(\d+)(.*)$/);
+    if (guildMatch) {
+      const guildId = guildMatch[1];
+      const subPath = guildMatch[2];
+      const majorParam = `guild:${guildId}`;
+
+      let routePattern = `${method}:/guilds/:id`;
+      if (subPath.startsWith('/channels')) {
+        routePattern = `${method}:/guilds/:id/channels`;
+      } else if (subPath.startsWith('/members/search')) {
+        routePattern = `${method}:/guilds/:id/members/search`;
+      } else if (subPath.match(/^\/members\/\d+$/)) {
+        routePattern = `${method}:/guilds/:id/members/:id`;
+      } else if (subPath.startsWith('/members')) {
+        routePattern = `${method}:/guilds/:id/members`;
+      }
+      return { routeKey: `${routePattern}:${majorParam}`, majorParam };
+    }
+
+    // Top-level routes: /users/@me, /users/@me/guilds
     return { routeKey: `${method}:${cleanPath}`, majorParam: 'top_level' };
   }
 
@@ -73,6 +151,9 @@ export class DiscordApiService {
    * Executes an HTTP request to the Discord API with rate-limit bucket scheduling
    * scoped to (bucketHash, majorResource), proactive rate limit delay, global 429 locks,
    * and exponential backoff on 5xx.
+   *
+   * To prevent alias-convergence races where a route learns an already-existing canonical bucket,
+   * any queued requests from the temporary bucket are merged directly into the canonical bucket queue.
    */
   public static async request<T = any>(
     path: string,
@@ -83,28 +164,13 @@ export class DiscordApiService {
     const method = (options.method || 'GET').toUpperCase();
     const { routeKey, majorParam } = this.parseRouteInfo(method, path);
 
-    // Derive effective bucket key combining learned bucket hash and major parameter
+    // Look up canonical bucket identity or temporary route bucket
     const effectiveBucketKey = this.routeToBucketIdentity.get(routeKey) || routeKey;
+    const bucket = this.getOrCreateBucket(effectiveBucketKey);
 
-    let bucket = this.buckets.get(effectiveBucketKey);
-    if (!bucket) {
-      bucket = {
-        remaining: 1,
-        resetTimestamp: 0,
-        queue: Promise.resolve()
-      };
-      this.buckets.set(effectiveBucketKey, bucket);
-    }
-
-    // Chain execution to serialize requests on the same rate limit bucket
-    const currentExecution = bucket.queue.then(async () => {
-      return this.executeWithRetry<T>(url, path, botToken, options, routeKey, majorParam, effectiveBucketKey);
+    return bucket.enqueue(async () => {
+      return this.executeWithRetry<T>(url, path, botToken, options, routeKey, majorParam);
     });
-
-    // Update queue head without causing unhandled rejections in the chain
-    bucket.queue = currentExecution.then(() => {}, () => {});
-
-    return currentExecution;
   }
 
   private static async executeWithRetry<T>(
@@ -113,8 +179,7 @@ export class DiscordApiService {
     botToken: string,
     options: DiscordRequestOptions,
     routeKey: string,
-    majorParam: string,
-    initialBucketKey: string
+    majorParam: string
   ): Promise<{ data: T; headers: Headers }> {
     const maxRetries = options.maxRetries ?? 5;
     let attempt = 0;
@@ -123,7 +188,7 @@ export class DiscordApiService {
     while (attempt <= maxRetries) {
       attempt++;
 
-      // Wait if a global rate limit is currently active
+      // Wait if a global rate limit is active
       const now = Date.now();
       if (this.globalResetTimestamp > now) {
         const waitMs = this.globalResetTimestamp - now;
@@ -131,8 +196,8 @@ export class DiscordApiService {
         await new Promise(resolve => setTimeout(resolve, waitMs));
       }
 
-      // Check per-bucket quota and delay if remaining capacity is exhausted
-      const activeBucketKey = this.routeToBucketIdentity.get(routeKey) || initialBucketKey;
+      // Check active bucket capacity and delay if quota is exhausted
+      const activeBucketKey = this.routeToBucketIdentity.get(routeKey) || routeKey;
       const bucket = this.buckets.get(activeBucketKey);
       if (bucket && bucket.remaining <= 0 && bucket.resetTimestamp > Date.now()) {
         const waitMs = Math.max(0, bucket.resetTimestamp - Date.now()) + 25;
@@ -150,32 +215,35 @@ export class DiscordApiService {
       const fetchOptions: RequestInit = {
         ...options,
         headers,
-        body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body
+        body: options.body && typeof options.body !== 'string' ? JSON.stringify(options.body) : options.body as BodyInit
       };
 
       try {
         const res = await fetch(url, fetchOptions);
 
-        // Update bucket metadata from response headers
         const bucketHeader = res.headers.get('X-RateLimit-Bucket');
         const remainingHeader = res.headers.get('X-RateLimit-Remaining');
         const resetAfterHeader = res.headers.get('X-RateLimit-Reset-After');
         const isGlobalHeader = res.headers.get('X-RateLimit-Global') === 'true';
 
+        // When Discord returns a bucket hash, associate route and migrate queued work to the canonical bucket
         if (bucketHeader) {
-          // Scope bucket identity to (bucketHeader, majorParam)
           const learnedBucketIdentity = `${bucketHeader}:${majorParam}`;
-          this.routeToBucketIdentity.set(routeKey, learnedBucketIdentity);
+          const currentActiveKey = this.routeToBucketIdentity.get(routeKey) || routeKey;
 
-          let targetBucket = this.buckets.get(learnedBucketIdentity);
-          if (!targetBucket) {
-            targetBucket = {
-              remaining: 1,
-              resetTimestamp: 0,
-              queue: Promise.resolve()
-            };
-            this.buckets.set(learnedBucketIdentity, targetBucket);
+          if (learnedBucketIdentity !== currentActiveKey) {
+            this.routeToBucketIdentity.set(routeKey, learnedBucketIdentity);
+
+            const canonicalBucket = this.getOrCreateBucket(learnedBucketIdentity);
+            const temporaryBucket = this.buckets.get(routeKey);
+
+            if (temporaryBucket && temporaryBucket !== canonicalBucket) {
+              canonicalBucket.mergeFrom(temporaryBucket);
+              this.buckets.delete(routeKey);
+            }
           }
+
+          const targetBucket = this.getOrCreateBucket(learnedBucketIdentity);
           if (remainingHeader !== null) {
             const parsedRemaining = parseInt(remainingHeader, 10);
             if (!isNaN(parsedRemaining)) {
@@ -196,7 +264,7 @@ export class DiscordApiService {
           let isGlobal429 = isGlobalHeader;
 
           try {
-            const rawBody = await res.json();
+            const rawBody = (await res.json()) as DiscordRateLimitResponse;
             if (rawBody && typeof rawBody.retry_after === 'number') {
               retryAfterMs = Math.ceil(rawBody.retry_after * 1000);
             }
@@ -219,12 +287,10 @@ export class DiscordApiService {
             this.globalResetTimestamp = Date.now() + retryAfterMs;
             logger.warn(`Discord API 429 global rate limit: pausing all requests for ${retryAfterMs}ms`);
           } else {
-            const currentActiveKey = this.routeToBucketIdentity.get(routeKey) || initialBucketKey;
-            const targetBucket = this.buckets.get(currentActiveKey);
-            if (targetBucket) {
-              targetBucket.remaining = 0;
-              targetBucket.resetTimestamp = Date.now() + retryAfterMs;
-            }
+            const currentActiveKey = this.routeToBucketIdentity.get(routeKey) || routeKey;
+            const targetBucket = this.getOrCreateBucket(currentActiveKey);
+            targetBucket.remaining = 0;
+            targetBucket.resetTimestamp = Date.now() + retryAfterMs;
             logger.warn(`Discord API 429 route rate limit on ${path}: waiting ${retryAfterMs}ms (attempt ${attempt}/${maxRetries})`);
           }
 
@@ -235,7 +301,7 @@ export class DiscordApiService {
           throw new DiscordApiError(`Rate limit exceeded after ${maxRetries} retries`, 429, 429);
         }
 
-        // Handle 5xx Server Errors with bounded exponential backoff and jitter
+        // Handle 5xx Server Errors
         if (res.status >= 500 && res.status < 600) {
           if (attempt <= maxRetries) {
             const backoffMs = Math.min(8000, 500 * Math.pow(2, attempt - 1)) + Math.floor(Math.random() * 200);
@@ -248,15 +314,16 @@ export class DiscordApiService {
 
         // Handle 4xx Client Errors
         if (!res.ok) {
-          let rawBody: any = null;
+          let rawBody: unknown = null;
           let discordCode: number | undefined;
           let message = `Discord API returned HTTP ${res.status}`;
 
           try {
-            rawBody = await res.json();
-            if (rawBody) {
-              discordCode = rawBody.code;
-              message = rawBody.message || message;
+            const parsedBody = (await res.json()) as DiscordErrorResponse;
+            if (parsedBody) {
+              rawBody = parsedBody;
+              discordCode = parsedBody.code;
+              message = parsedBody.message || message;
             }
           } catch {
             // Body was not JSON
@@ -266,24 +333,26 @@ export class DiscordApiService {
         }
 
         if (res.status === 204) {
-          return { data: null as any, headers: res.headers };
+          return { data: null as T, headers: res.headers };
         }
 
-        const data = await res.json();
+        const data = (await res.json()) as T;
         return { data, headers: res.headers };
-      } catch (err: any) {
+      } catch (err: unknown) {
         if (err instanceof DiscordApiError) {
           throw err;
         }
 
+        const errorMessage = err instanceof Error ? err.message : String(err);
+
         if (attempt <= maxRetries) {
           const backoffMs = 500 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
-          logger.warn(`Network error requesting ${path}: ${err.message}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
+          logger.warn(`Network error requesting ${path}: ${errorMessage}. Retrying in ${backoffMs}ms (attempt ${attempt}/${maxRetries})`);
           await new Promise(resolve => setTimeout(resolve, backoffMs));
           continue;
         }
 
-        throw new DiscordApiError(`Network failure communicating with Discord API: ${err.message}`, 0);
+        throw new DiscordApiError(`Network failure communicating with Discord API: ${errorMessage}`, 0);
       }
     }
 
@@ -291,13 +360,13 @@ export class DiscordApiService {
   }
 
   /**
-   * Evaluates effective channel permissions following Discord's permission resolution hierarchy:
+   * Evaluates channel permissions following Discord's permission resolution hierarchy:
    * 1. Administrator override grants all permissions unconditionally.
-   * 2. Base permissions derive from @everyone and member roles.
-   * 3. @everyone channel overwrite applies first.
-   * 4. Member role overwrites aggregate: role denies apply, then role allows apply.
-   * 5. Member-specific overwrite applies last (deny, then allow).
-   * 6. Visibility dependency: if VIEW_CHANNEL is denied, reading history and managing messages are denied.
+   * 2. Base guild permissions from @everyone and member roles.
+   * 3. @everyone channel overwrite.
+   * 4. Member role overwrites: role denies apply, then role allows apply.
+   * 5. Member-specific user overwrite (deny, then allow).
+   * 6. If VIEW_CHANNEL is denied, dependent read history and manage messages capabilities are denied.
    */
   public static computeChannelPermissions(
     baseGuildPermissions: bigint,
@@ -379,7 +448,7 @@ export class DiscordApiService {
   }
 
   /**
-   * Resets internal rate limit state (primarily used in test fixtures).
+   * Resets internal rate limit state (used in test fixtures).
    */
   public static resetRateLimits(): void {
     this.globalResetTimestamp = 0;

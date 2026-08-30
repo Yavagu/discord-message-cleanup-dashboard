@@ -1,6 +1,6 @@
 {
   "name": "discord-message-cleanup-dashboard",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Secure, rate-limited, and timezone-accurate Discord message cleanup and purge dashboard.",
   "license": "GPL-3.0",
   "repository": {

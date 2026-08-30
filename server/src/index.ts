@@ -134,7 +134,7 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'Discord Cleanup Backend',
-    version: '1.0.0',
+    version: '2.0.3',
     timestamp: new Date().toISOString()
   });
 });
