@@ -11,7 +11,7 @@
   "dependencies": {
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
+    "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "luxon": "^3.5.0",
     "uuid": "^11.0.5",
