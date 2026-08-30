@@ -68,6 +68,10 @@ A high-performance, professional moderation and bulk message purge dashboard for
 
 ## Screenshots
 
+<details>
+<summary><b>📸 Click to Expand / View Full UI Screenshots (6 Views)</b></summary>
+<br>
+
 ### 1. Operations Center & Dashboard Overview
 ![Operations Center & Dashboard Overview](screenshots/dashboard.png)
 
@@ -85,6 +89,8 @@ A high-performance, professional moderation and bulk message purge dashboard for
 
 ### 6. Destructive Safeguards & Application Settings
 ![Destructive Safeguards & Application Settings](screenshots/safety-settings.png)
+
+</details>
 
 ---
 
