@@ -80,11 +80,11 @@ A high-performance, professional moderation and bulk message purge dashboard for
 ### 4. Persistent Cleanup Audit History
 ![Cleanup Audit History](screenshots/cleanup-history.png)
 
-### 5. Interactive Message Preview & Selection Table
-> *Placeholder: Interactive message inspection modal and preview table (Slot 5).*
+### 5. Detailed Cleanup Report & Channel Deletion Breakdown
+![Detailed Cleanup Report](screenshots/cleanup-report.png)
 
-### 6. Real-Time SSE Purge Execution & Failure Breakdown
-> *Placeholder: Live deletion progress bar, rate-limit pacing ETA, and error reporting (Slot 6).*
+### 6. Destructive Safeguards & Application Settings
+![Destructive Safeguards & Application Settings](screenshots/safety-settings.png)
 
 ---
 
