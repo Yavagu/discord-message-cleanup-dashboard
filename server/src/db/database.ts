@@ -11,7 +11,7 @@ if (!fs.existsSync(dataDir)) {
 const dbPath = path.join(dataDir, 'cleanup_dashboard.db');
 export const db = new DatabaseSync(dbPath);
 
-// Enable WAL mode and foreign keys for high concurrency & integrity
+// Enable WAL mode and foreign keys for high concurrency & data integrity
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA foreign_keys = ON;');
 
@@ -31,7 +31,16 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON admin_sessions(expires_at);
   `);
 
-  // 2. Cleanup Jobs table
+  // 2. Application Settings table (Persistent runtime configuration)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+
+  // 3. Cleanup Jobs table
   db.exec(`
     CREATE TABLE IF NOT EXISTS cleanup_jobs (
       id TEXT PRIMARY KEY,
@@ -61,7 +70,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_cleanup_jobs_status ON cleanup_jobs(status);
   `);
 
-  // 3. Scanned Messages table (stores messages found during scan for revalidation & preview)
+  // 4. Scanned Messages table (stores messages found during scan for revalidation & preview)
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_scanned_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,7 +98,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_scanned_job_channel ON job_scanned_messages(job_id, channel_id);
   `);
 
-  // 4. Job Failures table (records detailed failure reasons for reporting)
+  // 5. Job Failures table (records detailed failure reasons for reporting)
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_failures (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +116,7 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_failures_job ON job_failures(job_id);
   `);
 
-  // 5. Audit logs table (admin action trail)
+  // 6. Audit logs table (admin action trail)
   db.exec(`
     CREATE TABLE IF NOT EXISTS audit_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { api, setCsrfToken } from '../services/api';
-import { BotStatus, DiscordGuild } from '../types';
+import { AppSettings, BotStatus, DiscordGuild } from '../types';
 
 export interface ToastItem {
   id: string;
@@ -33,6 +33,11 @@ interface AppContextType {
   setSelectedGuild: (guild: DiscordGuild | null) => void;
   refreshGuilds: () => Promise<void>;
 
+  // Settings
+  settings: AppSettings | null;
+  refreshSettings: () => Promise<void>;
+  updateSettings: (partial: Partial<AppSettings>) => Promise<void>;
+
   // Timezone
   timezone: string;
   setTimezone: (tz: string) => void;
@@ -58,7 +63,7 @@ interface AppContextType {
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
-// Detect browser timezone
+// Detect browser timezone as fallback default
 const defaultBrowserTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
@@ -70,6 +75,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [botStatus, setBotStatus] = useState<BotStatus | null>(null);
   const [guilds, setGuilds] = useState<DiscordGuild[]>([]);
   const [selectedGuild, setSelectedGuild] = useState<DiscordGuild | null>(null);
+  const [settings, setSettings] = useState<AppSettings | null>(null);
 
   const [timezone, setTimezone] = useState<string>(() => {
     return localStorage.getItem('cleanup_timezone') || defaultBrowserTz;
@@ -95,7 +101,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     localStorage.setItem('cleanup_theme', theme);
   }, [theme]);
 
-  // Sync timezone
+  // Sync timezone to local storage
   useEffect(() => {
     localStorage.setItem('cleanup_timezone', timezone);
   }, [timezone]);
@@ -116,8 +122,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCsrfTokenState(res.session.csrfToken);
         setCsrfToken(res.session.csrfToken);
 
-        await refreshBotStatus();
-        await refreshGuilds();
+        await Promise.all([
+          refreshBotStatus(),
+          refreshGuilds(),
+          refreshSettings()
+        ]);
       } else {
         setAuthenticated(false);
       }
@@ -167,6 +176,39 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
+  const refreshSettings = async () => {
+    try {
+      const s = await api.getSettings();
+      setSettings(s);
+      if (s.defaultTimezone && !localStorage.getItem('cleanup_timezone')) {
+        setTimezone(s.defaultTimezone);
+      }
+    } catch (err: any) {
+      console.error('Failed to fetch settings', err);
+    }
+  };
+
+  const updateSettings = async (partial: Partial<AppSettings>) => {
+    try {
+      const res = await api.updateSettings(partial);
+      if (res.success) {
+        setSettings(res.settings);
+        addToast({
+          type: 'success',
+          title: 'Settings Saved',
+          message: 'Moderation safeguards and rate-limit pacing updated.'
+        });
+      }
+    } catch (err: any) {
+      addToast({
+        type: 'error',
+        title: 'Failed to Save Settings',
+        message: err.message
+      });
+      throw err;
+    }
+  };
+
   const login = async (password: string): Promise<boolean> => {
     try {
       const res = await api.login(password);
@@ -177,8 +219,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCsrfTokenState(res.session.csrfToken);
         setCsrfToken(res.session.csrfToken);
         addToast({ type: 'success', title: 'Logged In', message: 'Welcome to the Administrator Dashboard' });
-        await refreshBotStatus();
-        await refreshGuilds();
+        await Promise.all([
+          refreshBotStatus(),
+          refreshGuilds(),
+          refreshSettings()
+        ]);
         return true;
       }
       return false;
@@ -198,8 +243,11 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         setCsrfTokenState(res.session.csrfToken);
         setCsrfToken(res.session.csrfToken);
         addToast({ type: 'info', title: 'Demo Mode Active', message: 'Loaded sample Discord servers, channels, and users.' });
-        await refreshBotStatus();
-        await refreshGuilds();
+        await Promise.all([
+          refreshBotStatus(),
+          refreshGuilds(),
+          refreshSettings()
+        ]);
         return true;
       }
       return false;
@@ -291,6 +339,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         selectedGuild,
         setSelectedGuild,
         refreshGuilds,
+        settings,
+        refreshSettings,
+        updateSettings,
         timezone,
         setTimezone,
         theme,

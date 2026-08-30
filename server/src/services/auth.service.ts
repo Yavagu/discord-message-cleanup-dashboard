@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { db } from '../db/database';
 import { AdminSession } from '../types';
@@ -6,7 +7,9 @@ import { logger } from '../utils/logger';
 // In-memory token cache keyed by session ID (NEVER persisted to disk or database)
 const inMemorySessionTokens = new Map<string, string>();
 
-// Clean up expired sessions on startup
+/**
+ * Clean up expired sessions on startup and during authentication checks.
+ */
 export function cleanupExpiredSessions() {
   const now = Date.now();
   try {
@@ -22,6 +25,35 @@ export function cleanupExpiredSessions() {
 
 export class AuthService {
   private static SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+  /**
+   * Verify password using constant-time comparison to prevent timing attacks.
+   */
+  public static verifyPassword(inputPassword: string): boolean {
+    if (!inputPassword || typeof inputPassword !== 'string') {
+      return false;
+    }
+
+    const expectedPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === 'production' ? '' : 'admin123');
+
+    if (!expectedPassword) {
+      logger.error('CRITICAL: ADMIN_PASSWORD environment variable is not configured in production mode.');
+      return false;
+    }
+
+    try {
+      const inputBuffer = Buffer.from(inputPassword, 'utf8');
+      const expectedBuffer = Buffer.from(expectedPassword, 'utf8');
+
+      if (inputBuffer.length !== expectedBuffer.length) {
+        return false;
+      }
+
+      return crypto.timingSafeEqual(inputBuffer, expectedBuffer);
+    } catch {
+      return false;
+    }
+  }
 
   public static createSession(adminUser: string, isDemo: boolean = false): AdminSession {
     cleanupExpiredSessions();
@@ -50,11 +82,13 @@ export class AuthService {
 
   public static getSession(sessionId: string): AdminSession | null {
     if (!sessionId) return null;
+    const now = Date.now();
+
     const row = db.prepare(`
       SELECT id, admin_user as adminUser, csrf_token as csrfToken, is_demo as isDemo, created_at as createdAt, expires_at as expiresAt
       FROM admin_sessions
       WHERE id = ? AND expires_at > ?
-    `).get(sessionId, Date.now()) as any;
+    `).get(sessionId, now) as any;
 
     if (!row) return null;
 

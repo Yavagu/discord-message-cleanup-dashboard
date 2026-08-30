@@ -1,8 +1,12 @@
 import { DiscordChannel } from '../types';
 import { MOCK_CHANNELS } from './mock.service';
+import { DiscordApiService } from './discord-api.service';
+import {
+  DiscordChannelType,
+  DiscordPermissions,
+  TEXT_BASED_CHANNEL_TYPES
+} from '../constants/discord.constants';
 import { logger } from '../utils/logger';
-
-const DISCORD_API_BASE = 'https://discord.com/api/v10';
 
 export class ChannelService {
   public static async getGuildChannels(
@@ -18,45 +22,67 @@ export class ChannelService {
       throw new Error('Bot token is required to fetch channels');
     }
 
-    const cleanToken = botToken.trim().replace(/^Bot\s+/i, '');
-    const res = await fetch(`${DISCORD_API_BASE}/guilds/${guildId}/channels`, {
-      headers: {
-        Authorization: `Bot ${cleanToken}`,
-        'User-Agent': 'DiscordCleanupDashboard/1.0'
+    try {
+      // 1. Fetch guild channels
+      const { data: rawChannels } = await DiscordApiService.request<any[]>(
+        `/guilds/${guildId}/channels`,
+        botToken
+      );
+
+      if (!Array.isArray(rawChannels)) {
+        return [];
       }
-    });
 
-    if (!res.ok) {
-      logger.error(`Discord API error fetching channels for guild ${guildId}: ${res.status}`);
-      throw new Error(`Failed to fetch channels from Discord API (${res.status})`);
-    }
-
-    const rawChannels = await res.json() as any[];
-
-    // Map parent category names for better UX
-    const categoryMap = new Map<string, string>();
-    for (const c of rawChannels) {
-      if (c.type === 4) { // Category
-        categoryMap.set(c.id, c.name);
+      // Map parent category names for structured UX display
+      const categoryMap = new Map<string, string>();
+      for (const c of rawChannels) {
+        if (c.type === DiscordChannelType.GUILD_CATEGORY) {
+          categoryMap.set(c.id, c.name);
+        }
       }
+
+      // 2. Fetch bot's guild permissions to accurately evaluate channel permissions
+      let guildBasePermissions: bigint = DiscordPermissions.ADMINISTRATOR; // fallback assumption if admin
+      try {
+        const { data: userGuilds } = await DiscordApiService.request<any[]>('/users/@me/guilds?limit=200', botToken);
+        const thisGuild = userGuilds.find((g: any) => g.id === guildId);
+        if (thisGuild && thisGuild.permissions) {
+          guildBasePermissions = BigInt(thisGuild.permissions);
+        }
+      } catch (err) {
+        logger.warn(`Could not verify guild base permissions for guild ${guildId}`, err);
+      }
+
+      // 3. Filter channels supporting message histories and compute real permissions
+      const accessibleChannels: DiscordChannel[] = rawChannels
+        .filter(c => TEXT_BASED_CHANNEL_TYPES.includes(c.type))
+        .map(c => {
+          const overwrites = Array.isArray(c.permission_overwrites) ? c.permission_overwrites : [];
+          const evaluated = DiscordApiService.computeChannelPermissions(
+            guildBasePermissions,
+            overwrites,
+            guildId
+          );
+
+          return {
+            id: c.id,
+            name: c.name,
+            type: c.type,
+            parentId: c.parent_id || null,
+            parentName: c.parent_id ? categoryMap.get(c.parent_id) || null : null,
+            position: c.position || 0,
+            canView: evaluated.canView,
+            canReadHistory: evaluated.canReadHistory,
+            canManageMessages: evaluated.canManageMessages,
+            permissionOverwrites: overwrites
+          };
+        })
+        .sort((a, b) => (a.position || 0) - (b.position || 0));
+
+      return accessibleChannels;
+    } catch (err: any) {
+      logger.error(`Failed to fetch channels for guild ${guildId}`, err);
+      throw err;
     }
-
-    // Filter channels with message histories: 0 (GUILD_TEXT), 2 (GUILD_VOICE), 5 (GUILD_ANNOUNCEMENT), 13 (GUILD_STAGE_VOICE), 15 (GUILD_FORUM)
-    const accessibleChannels = rawChannels
-      .filter(c => [0, 2, 5, 13, 15].includes(c.type))
-      .map(c => ({
-        id: c.id,
-        name: c.name,
-        type: c.type,
-        parentId: c.parent_id || null,
-        parentName: c.parent_id ? categoryMap.get(c.parent_id) || null : null,
-        position: c.position || 0,
-        canView: true,
-        canReadHistory: true,
-        canManageMessages: true
-      }))
-      .sort((a, b) => (a.position || 0) - (b.position || 0));
-
-    return accessibleChannels;
   }
 }

@@ -1,10 +1,14 @@
 import { db } from '../db/database';
 import { CleanupFailure, JobProgressUpdate, JobStatus } from '../types';
 import { deleteMockMessage } from './mock.service';
+import { DiscordApiService, DiscordApiError } from './discord-api.service';
+import { SettingsService } from './settings.service';
+import {
+  DISCORD_BULK_DELETE_MAX_BATCH_SIZE,
+  DISCORD_BULK_DELETE_MIN_BATCH_SIZE,
+  getDiscordErrorDetail
+} from '../constants/discord.constants';
 import { logger } from '../utils/logger';
-
-const DISCORD_API_BASE = 'https://discord.com/api/v10';
-const BULK_DELETE_CUTOFF_DAYS = 13.85; // Strict safety threshold to never trigger 50034
 
 export interface DeletionProgressCallback {
   (update: JobProgressUpdate): void;
@@ -47,6 +51,8 @@ export class DeletionService {
   }> {
     this.clearCancellation(jobId);
     const startTime = Date.now();
+    const pacingMs = SettingsService.getPacingMs();
+    const bulkCutoffDays = SettingsService.getBulkCutoffDays();
 
     // 1. Backend Server-Side Revalidation
     // Verify job exists, belongs to session, and is in READY state
@@ -99,7 +105,7 @@ export class DeletionService {
       throw new Error('Conflict: Cleanup job is already being processed or is not in READY state');
     }
 
-    logger.info(`Job ${jobId} locked and transitioning to DELETING (${targetRows.length} messages)`);
+    logger.info(`Job ${jobId} locked and transitioning to DELETING (${targetRows.length} messages, pacing: ${pacingMs}ms)`);
 
     const totalSelected = targetRows.length;
     let deletedCount = 0;
@@ -116,13 +122,11 @@ export class DeletionService {
       channelMap.get(msg.channel_id)!.push(msg);
     }
 
-    const cleanToken = botToken ? botToken.trim().replace(/^Bot\s+/i, '') : '';
-
     const emitProgress = (channelName?: string, currentMsgId?: string) => {
       const remaining = totalSelected - processedCount;
       const percent = totalSelected > 0 ? Math.round((processedCount / totalSelected) * 100) : 100;
       const elapsedSec = (Date.now() - startTime) / 1000;
-      const rate = processedCount > 0 ? processedCount / elapsedSec : 1;
+      const rate = processedCount > 0 && elapsedSec > 0 ? processedCount / elapsedSec : 1;
       const etaSeconds = Math.round(remaining / rate);
 
       if (onProgress) {
@@ -137,6 +141,7 @@ export class DeletionService {
           percent,
           currentChannelName: channelName,
           currentMessageId: currentMsgId,
+          rateLimitPacingMs: pacingMs,
           etaSeconds
         });
       }
@@ -153,14 +158,12 @@ export class DeletionService {
 
       const channelName = msgs[0]?.channel_name || channelId;
 
-      // Split messages into:
-      // A. Bulk-eligible: age_days <= BULK_DELETE_CUTOFF_DAYS
-      // B. Individual only: age_days > BULK_DELETE_CUTOFF_DAYS
+      // Segment messages based on active bulk delete cutoff threshold
       const bulkEligible: any[] = [];
       const individualOnly: any[] = [];
 
       for (const m of msgs) {
-        if (m.age_days <= BULK_DELETE_CUTOFF_DAYS) {
+        if (m.age_days <= bulkCutoffDays) {
           bulkEligible.push(m);
         } else {
           individualOnly.push(m);
@@ -171,18 +174,18 @@ export class DeletionService {
       while (bulkEligible.length > 0) {
         if (this.isCancelled(jobId)) break;
 
-        // If only 1 message remains in eligible batch, fall back to individual delete
-        if (bulkEligible.length === 1) {
+        // If only 1 message remains, Discord bulk delete rejects it (min 2 messages); route to single delete
+        if (bulkEligible.length < DISCORD_BULK_DELETE_MIN_BATCH_SIZE) {
           individualOnly.push(bulkEligible.pop()!);
           break;
         }
 
-        const batch = bulkEligible.splice(0, Math.min(100, bulkEligible.length));
+        const batch = bulkEligible.splice(0, Math.min(DISCORD_BULK_DELETE_MAX_BATCH_SIZE, bulkEligible.length));
         const batchIds = batch.map(b => b.message_id);
 
         if (isDemo) {
           // Demo Mode bulk deletion simulation
-          await new Promise(r => setTimeout(r, 120)); // realistic API pacing
+          await new Promise(r => setTimeout(r, Math.max(50, pacingMs)));
           for (const b of batch) {
             deleteMockMessage(job.guild_id, b.message_id);
             deletedCount++;
@@ -190,48 +193,23 @@ export class DeletionService {
           }
           emitProgress(channelName, batchIds[0]);
         } else {
-          // Real Discord Bulk Delete
+          // Real Discord Bulk Delete via DiscordApiService
           try {
-            const bulkRes = await this.callDiscordWithRetry(
-              `${DISCORD_API_BASE}/channels/${channelId}/messages/bulk-delete`,
+            await DiscordApiService.request(
+              `/channels/${channelId}/messages/bulk-delete`,
+              botToken!,
               {
                 method: 'POST',
-                headers: {
-                  Authorization: `Bot ${cleanToken}`,
-                  'Content-Type': 'application/json',
-                  'User-Agent': 'DiscordCleanupDashboard/1.0'
-                },
-                body: JSON.stringify({ messages: batchIds })
+                body: { messages: batchIds }
               }
             );
 
-            if (bulkRes.ok || bulkRes.status === 204) {
-              deletedCount += batch.length;
-              processedCount += batch.length;
-            } else {
-              // Parse error
-              const errBody = await bulkRes.json().catch(() => ({})) as any;
-              const errorCode = errBody.code || bulkRes.status;
-              const errorMsg = errBody.message || `HTTP ${bulkRes.status}`;
-
-              // If error was 50034 (bulk delete older than 14d) or 50013 (missing perms), record failure
-              for (const b of batch) {
-                failedCount++;
-                processedCount++;
-                failures.push({
-                  jobId,
-                  messageId: b.message_id,
-                  channelId,
-                  channelName,
-                  authorId: b.author_id,
-                  timestampUtc: b.timestamp_utc,
-                  errorCode: String(errorCode),
-                  failureReason: this.mapErrorCodeToReason(errorCode, errorMsg),
-                  suggestions: this.mapErrorCodeToSuggestion(errorCode)
-                });
-              }
-            }
+            deletedCount += batch.length;
+            processedCount += batch.length;
           } catch (err: any) {
+            const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
+            const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'BULK_ERROR', err.message);
+
             for (const b of batch) {
               failedCount++;
               processedCount++;
@@ -242,9 +220,9 @@ export class DeletionService {
                 channelName,
                 authorId: b.author_id,
                 timestampUtc: b.timestamp_utc,
-                errorCode: 'NETWORK_ERROR',
-                failureReason: err.message || 'Network error during bulk delete',
-                suggestions: 'Check internet connection and Discord status.'
+                errorCode: String(discordCode || err.statusCode || 'BULK_ERROR'),
+                failureReason: errorDetail.reason,
+                suggestions: errorDetail.suggestion
               });
             }
           }
@@ -257,11 +235,12 @@ export class DeletionService {
         if (this.isCancelled(jobId)) break;
 
         if (isDemo) {
-          // In demo mode: simulate occasional permission error on channel 106 if tested
-          await new Promise(r => setTimeout(r, 60)); // pacing
+          await new Promise(r => setTimeout(r, Math.max(30, Math.round(pacingMs * 0.6))));
+          // In demo mode: simulate permission error on channel 106 if tested
           if (m.channel_id === '106') {
             failedCount++;
             processedCount++;
+            const errorDetail = getDiscordErrorDetail(50013);
             failures.push({
               jobId,
               messageId: m.message_id,
@@ -270,8 +249,8 @@ export class DeletionService {
               authorId: m.author_id,
               timestampUtc: m.timestamp_utc,
               errorCode: '50013',
-              failureReason: 'Missing Permissions: Bot lacks MANAGE_MESSAGES in this channel',
-              suggestions: 'Grant the bot MANAGE_MESSAGES permission in the channel settings.'
+              failureReason: errorDetail.reason,
+              suggestions: errorDetail.suggestion
             });
           } else {
             deleteMockMessage(job.guild_id, m.message_id);
@@ -280,42 +259,20 @@ export class DeletionService {
           }
           emitProgress(channelName, m.message_id);
         } else {
-          // Real Discord Single Delete
+          // Real Discord Single Delete via DiscordApiService
           try {
-            const delRes = await this.callDiscordWithRetry(
-              `${DISCORD_API_BASE}/channels/${channelId}/messages/${m.message_id}`,
-              {
-                method: 'DELETE',
-                headers: {
-                  Authorization: `Bot ${cleanToken}`,
-                  'User-Agent': 'DiscordCleanupDashboard/1.0'
-                }
-              }
+            await DiscordApiService.request(
+              `/channels/${channelId}/messages/${m.message_id}`,
+              botToken!,
+              { method: 'DELETE' }
             );
 
-            if (delRes.ok || delRes.status === 204) {
-              deletedCount++;
-              processedCount++;
-            } else {
-              const errBody = await delRes.json().catch(() => ({})) as any;
-              const errorCode = errBody.code || delRes.status;
-              const errorMsg = errBody.message || `HTTP ${delRes.status}`;
-
-              failedCount++;
-              processedCount++;
-              failures.push({
-                jobId,
-                messageId: m.message_id,
-                channelId,
-                channelName,
-                authorId: m.author_id,
-                timestampUtc: m.timestamp_utc,
-                errorCode: String(errorCode),
-                failureReason: this.mapErrorCodeToReason(errorCode, errorMsg),
-                suggestions: this.mapErrorCodeToSuggestion(errorCode)
-              });
-            }
+            deletedCount++;
+            processedCount++;
           } catch (err: any) {
+            const discordCode = err instanceof DiscordApiError ? err.discordCode : undefined;
+            const errorDetail = getDiscordErrorDetail(discordCode || err.statusCode || 'SINGLE_ERROR', err.message);
+
             failedCount++;
             processedCount++;
             failures.push({
@@ -325,14 +282,14 @@ export class DeletionService {
               channelName,
               authorId: m.author_id,
               timestampUtc: m.timestamp_utc,
-              errorCode: 'NETWORK_ERROR',
-              failureReason: err.message || 'Network error during message delete',
-              suggestions: 'Check network connectivity.'
+              errorCode: String(discordCode || err.statusCode || 'SINGLE_ERROR'),
+              failureReason: errorDetail.reason,
+              suggestions: errorDetail.suggestion
             });
           }
 
-          // Respect rate limit pacing between single deletes (100ms)
-          await new Promise(r => setTimeout(r, 100));
+          // Respect configured pacing interval between single message deletions
+          await new Promise(r => setTimeout(r, pacingMs));
           emitProgress(channelName, m.message_id);
         }
       }
@@ -399,6 +356,7 @@ export class DeletionService {
         failed: failedCount,
         remaining: 0,
         percent: 100,
+        rateLimitPacingMs: pacingMs,
         etaSeconds: 0
       });
     }
@@ -411,98 +369,5 @@ export class DeletionService {
       failures,
       durationMs
     };
-  }
-
-  /**
-   * Safe fetch with rate limit (429) wait & bounded exponential retry + jitter
-   */
-  private static async callDiscordWithRetry(
-    url: string,
-    options: RequestInit,
-    maxRetries = 3
-  ): Promise<Response> {
-    let attempt = 0;
-
-    while (attempt < maxRetries) {
-      attempt++;
-      try {
-        const res = await fetch(url, options);
-
-        // Check for 429 Rate Limit
-        if (res.status === 429) {
-          const retryAfterHeader = res.headers.get('Retry-After');
-          let waitMs = 1000;
-
-          if (retryAfterHeader) {
-            waitMs = Math.ceil(parseFloat(retryAfterHeader) * 1000);
-          } else {
-            try {
-              const body = await res.clone().json() as any;
-              if (body.retry_after) {
-                waitMs = Math.ceil(body.retry_after * 1000);
-              }
-            } catch {}
-          }
-
-          logger.warn(`Discord Rate Limit hit (429). Waiting ${waitMs}ms before retry (attempt ${attempt}/${maxRetries})`);
-          await new Promise(resolve => setTimeout(resolve, waitMs + 50));
-          continue;
-        }
-
-        // Check for transient 5xx server errors
-        if (res.status >= 500 && attempt < maxRetries) {
-          const jitter = Math.random() * 100;
-          const backoff = Math.min(2000, 200 * Math.pow(2, attempt) + jitter);
-          logger.warn(`Discord 5xx Server Error (${res.status}). Backing off ${Math.round(backoff)}ms`);
-          await new Promise(resolve => setTimeout(resolve, backoff));
-          continue;
-        }
-
-        return res;
-      } catch (err: any) {
-        if (attempt >= maxRetries) throw err;
-        const jitter = Math.random() * 100;
-        const backoff = Math.min(2000, 200 * Math.pow(2, attempt) + jitter);
-        await new Promise(resolve => setTimeout(resolve, backoff));
-      }
-    }
-
-    throw new Error(`Max retries (${maxRetries}) exceeded calling Discord API`);
-  }
-
-  private static mapErrorCodeToReason(code: string | number, rawMsg: string): string {
-    const num = Number(code);
-    switch (num) {
-      case 50013:
-        return 'Missing Permissions: Bot does not have MANAGE_MESSAGES permission in this channel.';
-      case 10008:
-        return 'Unknown Message: The message has already been deleted or does not exist.';
-      case 50034:
-        return 'Invalid Bulk Delete: You can only bulk-delete messages that are under 14 days old.';
-      case 50001:
-        return 'Missing Access: Bot cannot view or access this channel.';
-      case 429:
-        return 'Rate Limit Exceeded: Discord temporarily throttled requests.';
-      case 401:
-        return 'Authentication Failed: Invalid or revoked bot token.';
-      default:
-        return rawMsg || `Discord API Error (${code})`;
-    }
-  }
-
-  private static mapErrorCodeToSuggestion(code: string | number): string {
-    const num = Number(code);
-    switch (num) {
-      case 50013:
-        return 'Verify the bot role has "Manage Messages" in channel/server permissions and is above the target in role hierarchy.';
-      case 10008:
-        return 'The message was likely deleted manually or by another moderator prior to this cleanup.';
-      case 50034:
-        return 'Older messages must be deleted individually. The system will handle this automatically on retry.';
-      case 50001:
-        return 'Ensure the bot has "View Channel" and "Read Message History" permissions.';
-      default:
-        return 'Review Discord server audit log and bot role permissions.';
-    }
   }
 }

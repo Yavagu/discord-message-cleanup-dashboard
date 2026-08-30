@@ -2,11 +2,10 @@ import { db } from '../db/database';
 import { FilterConfig, ScannedMessage, DiscordChannel } from '../types';
 import { FilterService } from './filter.service';
 import { getMockMessagesForGuild } from './mock.service';
-import { ChannelService } from './channel.service';
+import { DiscordApiService } from './discord-api.service';
+import { SettingsService } from './settings.service';
+import { DISCORD_DEFAULT_SCAN_PACING_MS } from '../constants/discord.constants';
 import { logger } from '../utils/logger';
-
-const DISCORD_API_BASE = 'https://discord.com/api/v10';
-const BULK_DELETE_AGE_LIMIT_DAYS = 13.9; // Safe margin below 14 days
 
 export class ScannerService {
   /**
@@ -34,7 +33,10 @@ export class ScannerService {
       ? channels
       : channels.filter(c => filter.channelIds.includes(c.id));
 
-    logger.info(`Starting message scan for job ${jobId} across ${targetChannels.length} channels (targetUser: ${filter.targetUserId})`);
+    const bulkCutoffDays = SettingsService.getBulkCutoffDays();
+    const maxMessagesPerChannel = SettingsService.getSettings().maxMessagesPerChannel;
+
+    logger.info(`Starting message scan for job ${jobId} across ${targetChannels.length} channels (targetUser: ${filter.targetUserId}, cutoff: ${bulkCutoffDays.toFixed(2)}d)`);
 
     if (isDemo) {
       // Demo Mode Scanning
@@ -48,7 +50,7 @@ export class ScannerService {
 
         if (FilterService.matchesFilter({ authorId: msg.authorId, timestampUtc: msg.timestampUtc }, filter)) {
           const ageDays = FilterService.calculateAgeDays(msg.timestampUtc);
-          const isBulkDeletable = ageDays <= BULK_DELETE_AGE_LIMIT_DAYS;
+          const isBulkDeletable = ageDays <= bulkCutoffDays;
           const formattedLocal = FilterService.formatLocalTimestamp(msg.timestampUtc, filter.timezone);
 
           matchingMessages.push({
@@ -77,34 +79,23 @@ export class ScannerService {
         throw new Error('Bot token is required to scan messages');
       }
 
-      const cleanToken = botToken.trim().replace(/^Bot\s+/i, '');
-
       for (const channel of targetChannels) {
         let lastMessageId: string | null = null;
         let keepScanningChannel = true;
         let channelScanCount = 0;
-        const MAX_MESSAGES_PER_CHANNEL = 1000; // safety ceiling per channel
 
-        while (keepScanningChannel && channelScanCount < MAX_MESSAGES_PER_CHANNEL) {
+        while (keepScanningChannel && channelScanCount < maxMessagesPerChannel) {
           try {
-            const url: string = lastMessageId
-              ? `${DISCORD_API_BASE}/channels/${channel.id}/messages?limit=100&before=${lastMessageId}`
-              : `${DISCORD_API_BASE}/channels/${channel.id}/messages?limit=100`;
+            const endpoint: string = lastMessageId
+              ? `/channels/${channel.id}/messages?limit=100&before=${lastMessageId}`
+              : `/channels/${channel.id}/messages?limit=100`;
 
-            const res = await fetch(url, {
-              headers: {
-                Authorization: `Bot ${cleanToken}`,
-                'User-Agent': 'DiscordCleanupDashboard/1.0'
-              }
-            });
+            const { data: rawMessages } = await DiscordApiService.request<any[]>(
+              endpoint,
+              botToken
+            );
 
-            if (!res.ok) {
-              logger.warn(`Failed to fetch messages for channel #${channel.name} (${channel.id}): HTTP ${res.status}`);
-              break;
-            }
-
-            const rawMessages = await res.json() as any[];
-            if (!rawMessages || rawMessages.length === 0) {
+            if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
               break;
             }
 
@@ -125,7 +116,7 @@ export class ScannerService {
 
               if (FilterService.matchesFilter({ authorId, timestampUtc }, filter)) {
                 const ageDays = FilterService.calculateAgeDays(timestampUtc);
-                const isBulkDeletable = ageDays <= BULK_DELETE_AGE_LIMIT_DAYS;
+                const isBulkDeletable = ageDays <= bulkCutoffDays;
                 const formattedLocal = FilterService.formatLocalTimestamp(timestampUtc, filter.timezone);
 
                 matchingMessages.push({
@@ -154,9 +145,9 @@ export class ScannerService {
             }
 
             // Pacing delay to avoid aggressive rate limits
-            await new Promise(resolve => setTimeout(resolve, 50));
+            await new Promise(resolve => setTimeout(resolve, DISCORD_DEFAULT_SCAN_PACING_MS));
           } catch (err) {
-            logger.error(`Error scanning channel ${channel.id}`, err);
+            logger.error(`Error scanning channel ${channel.id} (#${channel.name})`, err);
             break;
           }
         }

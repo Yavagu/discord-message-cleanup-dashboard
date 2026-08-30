@@ -1,7 +1,7 @@
 import { BotStatus } from '../types';
+import { DiscordApiService, DiscordApiError } from './discord-api.service';
+import { SettingsService } from './settings.service';
 import { logger } from '../utils/logger';
-
-const DISCORD_API_BASE = 'https://discord.com/api/v10';
 
 export class BotService {
   /**
@@ -14,27 +14,12 @@ export class BotService {
     error?: string;
   }> {
     if (!token || typeof token !== 'string') {
-      return { valid: false, error: 'Token is required' };
+      return { valid: false, error: 'Bot token is required' };
     }
 
-    const cleanToken = token.trim().replace(/^Bot\s+/i, '');
-
     try {
-      const res = await fetch(`${DISCORD_API_BASE}/users/@me`, {
-        headers: {
-          Authorization: `Bot ${cleanToken}`,
-          'User-Agent': 'DiscordCleanupDashboard/1.0'
-        }
-      });
+      const { data: user } = await DiscordApiService.request('/users/@me', token);
 
-      if (!res.ok) {
-        if (res.status === 401) {
-          return { valid: false, error: 'Invalid Discord Bot Token (401 Unauthorized)' };
-        }
-        return { valid: false, error: `Discord API returned status ${res.status}` };
-      }
-
-      const user = await res.json() as any;
       const avatarUrl = user.avatar
         ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
         : `https://cdn.discordapp.com/embed/avatars/${Number(user.discriminator || 0) % 5}.png`;
@@ -49,18 +34,23 @@ export class BotService {
         flags: user.flags || 0
       };
     } catch (err: any) {
-      logger.error('Failed to connect to Discord API', err);
+      logger.error('Failed to verify Discord bot token', err);
+      if (err instanceof DiscordApiError && err.statusCode === 401) {
+        return { valid: false, error: 'Invalid Discord Bot Token (401 Unauthorized)' };
+      }
       return { valid: false, error: err.message || 'Network error connecting to Discord' };
     }
   }
 
   /**
-   * Get comprehensive bot status, channel permissions, and privileged intent audit
+   * Get comprehensive bot status, server connectivity, and rate-limit pacing
    */
   public static async getBotStatus(
     isDemo: boolean,
     botToken?: string
   ): Promise<BotStatus> {
+    const pacingMs = SettingsService.getPacingMs();
+
     if (isDemo) {
       return {
         connected: true,
@@ -80,7 +70,7 @@ export class BotService {
           messageContent: true
         },
         guildCount: 3,
-        rateLimitSafetyMs: 50
+        rateLimitSafetyMs: pacingMs
       };
     }
 
@@ -98,7 +88,7 @@ export class BotService {
           messageContent: false
         },
         guildCount: 0,
-        rateLimitSafetyMs: 100
+        rateLimitSafetyMs: pacingMs
       };
     }
 
@@ -117,25 +107,19 @@ export class BotService {
           messageContent: false
         },
         guildCount: 0,
-        rateLimitSafetyMs: 100
+        rateLimitSafetyMs: pacingMs
       };
     }
 
-    // Check guilds count
+    // Query bot's guild count
     let guildCount = 0;
     try {
-      const cleanToken = botToken.trim().replace(/^Bot\s+/i, '');
-      const gRes = await fetch(`${DISCORD_API_BASE}/users/@me/guilds?limit=200`, {
-        headers: {
-          Authorization: `Bot ${cleanToken}`,
-          'User-Agent': 'DiscordCleanupDashboard/1.0'
-        }
-      });
-      if (gRes.ok) {
-        const guilds = await gRes.json() as any[];
+      const { data: guilds } = await DiscordApiService.request<any[]>('/users/@me/guilds?limit=200', botToken);
+      if (Array.isArray(guilds)) {
         guildCount = guilds.length;
       }
-    } catch {
+    } catch (e) {
+      logger.warn('Unable to query guild list for bot status', e);
       guildCount = 1;
     }
 
@@ -149,16 +133,16 @@ export class BotService {
         manageMessages: true
       },
       privilegedIntents: {
-        guildMembers: true, // evaluated when searching members
+        guildMembers: true, // evaluated dynamically during member queries
         messageContent: true
       },
       guildCount,
-      rateLimitSafetyMs: 100
+      rateLimitSafetyMs: pacingMs
     };
   }
 
   /**
-   * Helper to mask token for UI responses
+   * Helper to mask token for UI display
    */
   public static maskToken(): string {
     return '••••••••••••••••••••••••••••••••••••••••••••';

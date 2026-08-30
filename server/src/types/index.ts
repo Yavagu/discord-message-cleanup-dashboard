@@ -70,16 +70,24 @@ export interface DiscordGuild {
   hasManageMessagesPermission?: boolean;
 }
 
+export interface ChannelPermissionOverwrite {
+  id: string;
+  type: number; // 0 = role, 1 = member
+  allow: string;
+  deny: string;
+}
+
 export interface DiscordChannel {
   id: string;
   name: string;
-  type: number; // 0 = text, 2 = voice, 4 = category, 5 = announcement, 15 = forum, etc.
+  type: number;
   parentId?: string | null;
   parentName?: string | null;
   position?: number;
   canView?: boolean;
   canReadHistory?: boolean;
   canManageMessages?: boolean;
+  permissionOverwrites?: ChannelPermissionOverwrite[];
 }
 
 export interface ScannedMessage {
@@ -97,7 +105,7 @@ export interface ScannedMessage {
   attachmentCount: number;
   hasEmbeds: boolean;
   embedCount: number;
-  isBulkDeletable: boolean; // age <= 14 days
+  isBulkDeletable: boolean; // evaluated against configured safety cutoff
   ageDays: number;
 }
 
@@ -184,4 +192,37 @@ export interface AdminSession {
   botToken?: string; // in-memory session only
   createdAt: number;
   expiresAt: number;
+}
+
+export interface AppSettings {
+  pacingMs: number;
+  bulkCutoffHours: number;
+  requireDoubleConfirm: boolean;
+  defaultTimezone: string;
+  maxMessagesPerChannel: number;
+  updatedAt?: string;
+}
+
+export interface DashboardMetrics {
+  totalScanned: number;
+  totalDeleted: number;
+  totalFailed: number;
+  totalJobs: number;
+  successRate: number;
+  recentJobs: CleanupJob[];
+}
+
+export interface DetailedCleanupReport {
+  job: CleanupJob;
+  successRatePercent: number;
+  channelsSearched: Array<{ id: string; name: string }>;
+  channelBreakdown: Array<{
+    channelId: string;
+    channelName: string;
+    matched: number;
+    deleted: number;
+    failed: number;
+  }>;
+  failures: CleanupFailure[];
+  scannedSample: ScannedMessage[];
 }

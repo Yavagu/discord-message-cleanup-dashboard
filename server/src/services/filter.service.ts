@@ -1,5 +1,6 @@
 import { DateTime } from 'luxon';
 import { FilterConfig } from '../types';
+import { SettingsService } from './settings.service';
 
 export class FilterService {
   /**
@@ -7,7 +8,7 @@ export class FilterService {
    */
   public static formatLocalTimestamp(isoUtc: string, timezone: string): string {
     try {
-      const dt = DateTime.fromISO(isoUtc, { zone: 'utc' }).setZone(timezone);
+      const dt = DateTime.fromISO(isoUtc, { zone: 'utc' }).setZone(timezone || 'UTC');
       if (!dt.isValid) return isoUtc;
       return dt.toFormat('yyyy-MM-dd hh:mm:ss a ZZZZ');
     } catch {
@@ -25,7 +26,7 @@ export class FilterService {
     },
     filter: FilterConfig
   ): boolean {
-    // 1. Mandatory User ID check (strict immutable Discord User ID matching)
+    // 1. Mandatory User ID check (strict immutable Discord Snowflake User ID equality)
     if (!filter.targetUserId || message.authorId !== filter.targetUserId.trim()) {
       return false;
     }
@@ -37,7 +38,7 @@ export class FilterService {
       return false;
     }
 
-    // Reference now in the target timezone for relative presets
+    // Reference 'now' in the target timezone for relative presets (Today, Yesterday, Last 7 Days, etc.)
     const nowInTz = DateTime.now().setZone(timezone);
     const msgDateStr = msgDateTime.toFormat('yyyy-MM-dd'); // e.g. "2026-08-15"
 
@@ -159,7 +160,7 @@ export class FilterService {
             // Standard daytime window, e.g. 09:00 to 17:00
             return msgMinutes >= startMin && msgMinutes <= endMin;
           } else {
-            // Overnight window, e.g. 22:00 to 04:00
+            // Overnight window spanning midnight, e.g. 22:00 to 04:00
             return msgMinutes >= startMin || msgMinutes <= endMin;
           }
         } else if (startMin !== null) {
@@ -175,12 +176,22 @@ export class FilterService {
   }
 
   /**
-   * Calculates message age in days relative to current time
+   * Calculates message age in fractional days relative to current UTC time.
    */
   public static calculateAgeDays(timestampUtc: string): number {
     const msgTime = DateTime.fromISO(timestampUtc, { zone: 'utc' });
+    if (!msgTime.isValid) return 0;
     const now = DateTime.utc();
     const diff = now.diff(msgTime, 'days').days;
     return Math.max(0, diff);
+  }
+
+  /**
+   * Evaluates if a message is eligible for Discord bulk delete based on configured cutoff days.
+   */
+  public static isBulkDeletable(timestampUtc: string, customCutoffDays?: number): boolean {
+    const cutoffDays = customCutoffDays ?? SettingsService.getBulkCutoffDays();
+    const ageDays = this.calculateAgeDays(timestampUtc);
+    return ageDays <= cutoffDays;
   }
 }

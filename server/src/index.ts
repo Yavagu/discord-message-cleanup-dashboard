@@ -6,13 +6,21 @@ import { initDatabase, db } from './db/database';
 import { apiRouter } from './routes/api.routes';
 import { logger } from './utils/logger';
 import { JobService } from './services/job.service';
+import { SettingsService } from './services/settings.service';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// CORS configuration for local client
+// Validate production security invariants
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.ADMIN_PASSWORD || process.env.ADMIN_PASSWORD === 'admin123') {
+    logger.warn('⚠️ SECURITY WARNING: Running in production mode with default or empty ADMIN_PASSWORD. Set a strong secret in your environment.');
+  }
+}
+
+// CORS configuration for local dashboard client
 app.use(cors({
   origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
   credentials: true,
@@ -24,8 +32,9 @@ app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Initialize SQLite schema
+// Initialize SQLite schema and runtime settings
 initDatabase();
+SettingsService.getSettings();
 
 // Seed realistic initial history if DB has zero jobs
 function seedInitialData() {
@@ -33,7 +42,6 @@ function seedInitialData() {
   if (countRow && countRow.count === 0) {
     logger.info('Seeding initial sample cleanup jobs for history showcase...');
     try {
-      // Seed sample completed job
       const job1 = JobService.createJob(
         'system-seed',
         '112233445566778899',
@@ -76,8 +84,8 @@ function seedInitialData() {
           '987654321000000001',
           '2026-08-28T17:35:00.000Z',
           '50013',
-          'Missing Permissions: Bot lacks MANAGE_MESSAGES permission in #vip-lounge',
-          'Grant the bot MANAGE_MESSAGES permission in the channel settings.'
+          'Missing Permissions: Bot lacks MANAGE_MESSAGES in this channel.',
+          'Verify the bot role has "Manage Messages" in channel permissions and is placed above targets in the server role hierarchy.'
         );
       }
 
@@ -121,8 +129,13 @@ seedInitialData();
 app.use('/api', apiRouter);
 
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Discord Cleanup Backend', timestamp: new Date().toISOString() });
+app.get('/api/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Discord Cleanup Backend',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.listen(PORT, () => {

@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { AuthService } from '../services/auth.service';
 import { BotService } from '../services/bot.service';
 import { GuildService } from '../services/guild.service';
@@ -8,6 +9,7 @@ import { ScannerService } from '../services/scanner.service';
 import { DeletionService } from '../services/deletion.service';
 import { JobService } from '../services/job.service';
 import { HistoryService } from '../services/history.service';
+import { SettingsService } from '../services/settings.service';
 import { authMiddleware } from '../middleware/auth.middleware';
 import { db } from '../db/database';
 import { FilterConfig, ScannedMessage } from '../types';
@@ -22,13 +24,23 @@ apiRouter.use(authMiddleware);
 // 1. AUTHENTICATION & SESSION ROUTES
 // ==========================================
 
+const loginSchema = z.object({
+  password: z.string().min(1, 'Password is required'),
+  username: z.string().optional().default('admin')
+});
+
 apiRouter.post('/auth/login', (req: Request, res: Response) => {
-  const { password, username = 'admin' } = req.body;
+  const parseResult = loginSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    res.status(400).json({ error: parseResult.error.errors[0]?.message || 'Invalid login request' });
+    return;
+  }
 
-  // Simple admin auth check for local moderation dashboard (can be configured via env)
-  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+  const { password, username } = parseResult.data;
 
-  if (password !== ADMIN_PASSWORD && password !== 'admin') {
+  // Constant-time password verification without insecure fallback backdoor
+  const isValid = AuthService.verifyPassword(password);
+  if (!isValid) {
     res.status(401).json({ error: 'Invalid administrator password' });
     return;
   }
@@ -107,9 +119,20 @@ apiRouter.post('/auth/logout', (req: Request, res: Response) => {
 // 2. DISCORD BOT CONFIGURATION & AUDIT
 // ==========================================
 
+const botConnectSchema = z.object({
+  token: z.string().optional(),
+  isDemo: z.boolean().optional().default(false)
+});
+
 apiRouter.post('/bot/connect', async (req: Request, res: Response) => {
   try {
-    const { token, isDemo } = req.body;
+    const parseResult = botConnectSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: parseResult.error.errors[0]?.message || 'Invalid connection payload' });
+      return;
+    }
+
+    const { token, isDemo } = parseResult.data;
     const session = req.session!;
 
     if (isDemo) {
@@ -133,7 +156,7 @@ apiRouter.post('/bot/connect', async (req: Request, res: Response) => {
       return;
     }
 
-    // Attach token strictly in backend session memory
+    // Attach token strictly in backend session memory (never written to DB or disk)
     AuthService.setSessionBotToken(session.id, token);
     db.prepare('UPDATE admin_sessions SET is_demo = 0 WHERE id = ?').run(session.id);
     session.isDemo = false;
@@ -214,35 +237,59 @@ apiRouter.get('/guilds/:guildId/members', async (req: Request, res: Response) =>
 // 4. SCANNING & MESSAGE PREVIEW
 // ==========================================
 
+const scanRequestSchema = z.object({
+  guildId: z.string().min(1, 'Server ID is required'),
+  guildName: z.string().optional().default('Discord Server'),
+  targetUserId: z.string().regex(/^\d{17,20}$/, 'Target User ID must be a valid 17-20 digit Snowflake ID'),
+  targetUsername: z.string().optional().default('Target User'),
+  targetDisplayName: z.string().optional().default('Target User'),
+  targetAvatarUrl: z.string().optional().default(''),
+  channelIds: z.array(z.string()).optional().default([]),
+  timezone: z.string().optional().default('UTC'),
+  dateMode: z.enum([
+    'ALL_TIME',
+    'SPECIFIC_DATE',
+    'BEFORE_DATE',
+    'AFTER_DATE',
+    'BETWEEN_DATES',
+    'TODAY',
+    'YESTERDAY',
+    'LAST_7_DAYS',
+    'LAST_30_DAYS',
+    'CUSTOM_RANGE'
+  ]).optional().default('ALL_TIME'),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+  timeMode: z.enum(['ANY_TIME', 'AFTER_TIME', 'BEFORE_TIME', 'BETWEEN_TIMES']).optional().default('ANY_TIME'),
+  startTime: z.string().optional(),
+  endTime: z.string().optional()
+});
+
 apiRouter.post('/jobs/scan', async (req: Request, res: Response) => {
   try {
+    const parseResult = scanRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: parseResult.error.errors[0]?.message || 'Invalid scan parameters' });
+      return;
+    }
+
     const session = req.session!;
     const {
       guildId,
       guildName,
       targetUserId,
-      targetUsername = 'Target User',
-      targetDisplayName = 'Target User',
-      targetAvatarUrl = '',
-      channelIds = [],
-      timezone = 'UTC',
-      dateMode = 'ALL_TIME',
+      targetUsername,
+      targetDisplayName,
+      targetAvatarUrl,
+      channelIds,
+      timezone,
+      dateMode,
       startDate,
       endDate,
-      timeMode = 'ANY_TIME',
+      timeMode,
       startTime,
       endTime
-    } = req.body;
-
-    if (!guildId) {
-      res.status(400).json({ error: 'Server / Guild selection is required' });
-      return;
-    }
-
-    if (!targetUserId || !targetUserId.trim()) {
-      res.status(400).json({ error: 'Target Discord User ID is required for cleanup' });
-      return;
-    }
+    } = parseResult.data;
 
     // Fetch accessible channels for this guild
     const allChannels = await ChannelService.getGuildChannels(guildId, session.isDemo, session.botToken);
@@ -314,10 +361,9 @@ apiRouter.get('/jobs/:jobId', (req: Request, res: Response) => {
       return;
     }
 
-    // Optional query params for preview table search, channel filter, and pagination
     const search = (req.query.search as string) || '';
     const channelId = (req.query.channelId as string) || '';
-    const sort = (req.query.sort as string) || 'newest'; // newest | oldest
+    const sort = (req.query.sort as string) || 'newest';
     const page = parseInt(req.query.page as string, 10) || 1;
     const limit = parseInt(req.query.limit as string, 10) || 50;
     const offset = (page - 1) * limit;
@@ -386,13 +432,22 @@ apiRouter.get('/jobs/:jobId', (req: Request, res: Response) => {
 // 5. DELETION EXECUTION & SSE STREAM
 // ==========================================
 
+const deleteRequestSchema = z.object({
+  selectedMessageIds: z.array(z.string()).optional()
+});
+
 apiRouter.post('/jobs/:jobId/delete', async (req: Request, res: Response) => {
   try {
     const jobId = String(req.params.jobId);
-    const { selectedMessageIds } = req.body;
+    const parseResult = deleteRequestSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({ error: 'Invalid delete request payload' });
+      return;
+    }
+
+    const { selectedMessageIds } = parseResult.data;
     const session = req.session!;
 
-    // Non-blocking async deletion execution with SSE progress broadcasting
     res.json({ success: true, message: 'Deletion job started', jobId });
 
     DeletionService.executeDeletion(
@@ -427,7 +482,6 @@ apiRouter.post('/jobs/:jobId/cancel', (req: Request, res: Response) => {
 apiRouter.get('/jobs/:jobId/progress', (req: Request, res: Response) => {
   const jobId = String(req.params.jobId);
 
-  // SSE headers
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -437,7 +491,6 @@ apiRouter.get('/jobs/:jobId/progress', (req: Request, res: Response) => {
   res.write('\n');
   JobService.registerSSEClient(jobId, res);
 
-  // Send current state
   const job = JobService.getJobById(jobId);
   if (job) {
     const initialUpdate = {
@@ -522,6 +575,47 @@ apiRouter.get('/dashboard/stats', (req: Request, res: Response) => {
     res.json(metrics);
   } catch (err: any) {
     logger.error('Error in /dashboard/stats', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==========================================
+// 7. APPLICATION SETTINGS ROUTES
+// ==========================================
+
+const updateSettingsSchema = z.object({
+  pacingMs: z.number().min(25).max(2000).optional(),
+  bulkCutoffHours: z.number().min(24).max(336).optional(),
+  requireDoubleConfirm: z.boolean().optional(),
+  defaultTimezone: z.string().min(1).optional(),
+  maxMessagesPerChannel: z.number().min(100).max(10000).optional()
+});
+
+apiRouter.get('/settings', (req: Request, res: Response) => {
+  try {
+    const settings = SettingsService.getSettings();
+    res.json(settings);
+  } catch (err: any) {
+    logger.error('Error fetching settings', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+apiRouter.put('/settings', (req: Request, res: Response) => {
+  try {
+    const parseResult = updateSettingsSchema.safeParse(req.body);
+    if (!parseResult.success) {
+      res.status(400).json({
+        error: parseResult.error.errors[0]?.message || 'Invalid settings payload',
+        details: parseResult.error.errors
+      });
+      return;
+    }
+
+    const updated = SettingsService.updateSettings(parseResult.data);
+    res.json({ success: true, settings: updated });
+  } catch (err: any) {
+    logger.error('Error updating settings', err);
     res.status(500).json({ error: err.message });
   }
 });

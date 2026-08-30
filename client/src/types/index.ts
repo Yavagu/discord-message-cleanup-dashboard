@@ -31,6 +31,7 @@ export interface FilterConfig {
   targetUsername?: string;
   targetDisplayName?: string;
   targetAvatar?: string;
+  targetAvatarUrl?: string;
   channelIds: string[];
   timezone: string;
   dateMode: DateFilterMode;
@@ -140,7 +141,9 @@ export interface JobProgressUpdate {
   percent: number;
   currentChannelName?: string;
   currentMessageId?: string;
+  rateLimitPacingMs?: number;
   etaSeconds?: number;
+  error?: string;
 }
 
 export interface BotStatus {
@@ -162,6 +165,15 @@ export interface BotStatus {
   };
   guildCount: number;
   rateLimitSafetyMs: number;
+}
+
+export interface AppSettings {
+  pacingMs: number;
+  bulkCutoffHours: number;
+  requireDoubleConfirm: boolean;
+  defaultTimezone: string;
+  maxMessagesPerChannel: number;
+  updatedAt?: string;
 }
 
 export interface DetailedCleanupReport {

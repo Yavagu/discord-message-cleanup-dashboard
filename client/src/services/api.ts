@@ -1,4 +1,5 @@
 import {
+  AppSettings,
   BotStatus,
   CleanupJob,
   DashboardMetrics,
@@ -131,6 +132,14 @@ export const api = {
   getJobReport: (jobId: string) => request<DetailedCleanupReport>(`/api/reports/${jobId}`),
 
   getDashboardMetrics: () => request<DashboardMetrics>('/api/dashboard/stats'),
+
+  // Settings
+  getSettings: () => request<AppSettings>('/api/settings'),
+
+  updateSettings: (settings: Partial<AppSettings>) => request<{ success: boolean; settings: AppSettings }>('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings)
+  }),
 
   // Export URLs
   getJsonExportUrl: (jobId: string) => `/api/reports/${jobId}/export/json`,
